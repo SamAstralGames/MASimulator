@@ -171,6 +171,29 @@ def _pct(v):
     return "n/a" if v is None else f"{v * 100:.0f} %"
 
 
+def _ligne_botx(d):
+    """Réglages BotX d'une ligne de détail sauvegardée (ou la raison de leur absence)."""
+    params = d.get("botx_params")
+    if params is None:
+        if d.get("trailing_botx") is not None and d.get("risque_botx") is not None:    # anciens formats
+            t = d["trailing_botx"]
+            return (f"BotX : RiskPerTradePct {d['risque_botx']:.3g}, "
+                    + (f"TrailingStopPct {t:g}" if t else "TrailingStopPct 0 (sans stop)"))
+        return "BotX : non transposable (pas de correspondance exacte pour cette sortie)"
+    if params["StopMode"] == "AtrFixed":
+        texte = (f"BotX : StopMode AtrFixed, AtrMultiplier {params['AtrMultiplier']:g}, "
+                 f"AtrPeriod {params['AtrPeriod']}")
+        if d.get("risque_botx") is not None:
+            texte += (f", RiskPerTradePct ~ {d['risque_botx']:.3g} "
+                      f"(approximatif : distance médiane {d['distance_stop_pct']:.3g} % du prix)")
+        return texte
+    t = params["TrailingStopPct"]
+    texte = ("BotX : StopMode Percent, " + (f"TrailingStopPct {t:g}" if t else "TrailingStopPct 0 (sans stop)"))
+    if d.get("risque_botx") is not None:
+        texte += f", RiskPerTradePct {d['risque_botx']:.3g}"
+    return texte
+
+
 def resume(c: Config):
     """Texte lisible et copiable : de quoi retrouver et recréer la config à la main."""
     p = c.parametres.get("regles", {})
@@ -208,13 +231,7 @@ def resume(c: Config):
             lignes.append(f"  {titre} « {d['nom']} » : {d['n_trades']} trades, "
                           f"{d['rendement_pct']:+.1f} %, DD {d['dd_pct']:.1f} %, "
                           f"P(réussite) {_pct(d.get('p_reussite'))}{levier}")
-            if d.get("risque_botx") is not None:
-                t = d["trailing_botx"]
-                lignes.append(f"    BotX : RiskPerTradePct {d['risque_botx']:.3g}, "
-                              + (f"TrailingStopPct {t:g}" if t else "TrailingStopPct 0 (sans stop)"))
-            elif d.get("levier") is not None:
-                lignes.append("    BotX : non transposable (le stop ATR du simulateur est fixe, "
-                              "le mode ATR de BotX est un trailing)")
+            lignes.append("    " + _ligne_botx(d))
     if c.note.strip():
         lignes.append(f"Note : {c.note.strip()}")
     return "\n".join(lignes)

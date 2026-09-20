@@ -7,13 +7,13 @@ from dataclasses import asdict, dataclass, field, replace
 import os
 
 import numpy as np
-from PySide6.QtCore import QDate, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDate, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QInputDialog, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QTableWidget,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -22,8 +22,8 @@ from .. import tendance as tend
 from . import charts
 from .webview import PlotlyView
 
-ONGLETS = ("Vue d'ensemble", "Criblage", "Détail", "Challenge", "Comparaison", "Configs")
-T_APERCU, T_CRIBLE, T_DETAIL, T_CHALLENGE, T_COMPARAISON, T_CONFIGS = range(6)
+ONGLETS = ("Vue d'ensemble", "Criblage", "Détail", "Challenge", "Comparaison")
+T_APERCU, T_CRIBLE, T_DETAIL, T_CHALLENGE, T_COMPARAISON = range(5)
 FRAICHEUR_MAX_JOURS = 7
 ROUGE = QBrush(QColor("#D55E00"))
 _AUCUNE = engine.LigneCrible("", "", 0, 0, 0, 0.0, 0.0, None, None, None)
@@ -160,15 +160,15 @@ class _Num(QTableWidgetItem):
 
 
 def _cellules_botx(l):
-    """Cellules « Trailing BotX % » et « Risque BotX % » d'une ligne de détail."""
+    """Cellules « Stop BotX » et « Risque BotX % » d'une ligne de détail."""
     gris = QBrush(QColor("#999999"))
-    t, r = l.trailing_botx, l.risque_botx
-    if t is None:
-        if l.politique is None or l.levier is None:
-            return [_Num("-"), _Num("-")]
+    if l.politique is None or l.levier is None:
+        return [_Num("-"), _Num("-")]
+    stop, r = l.stop_botx, l.risque_botx
+    if stop is None:
         return [_Num("non transp.", brush=gris), _Num("non transp.", brush=gris)]
-    return [_Num(f"{t:g}" if t else "0 (aucun)", t),
-            _Num("-" if r is None else f"{r:.3g}", r)]
+    approx = l.parametres_botx["StopMode"] == "AtrFixed"
+    return [_Num(stop), _Num("-" if r is None else f"{'~' if approx else ''}{r:.3g}", r)]
 
 
 def _fond_p(p):
@@ -202,33 +202,6 @@ def _jour(t):
 
 def _retard_jours(date):
     return int((np.datetime64("today") - date.astype("datetime64[D]")) / np.timedelta64(1, "D"))
-
-
-class DialogueNote(QDialog):
-    """Saisie d'une note, avec en option le résumé de la config concernée."""
-
-    def __init__(self, titre, resume="", note="", parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(titre)
-        self.resize(560, 420)
-        v = QVBoxLayout(self)
-        if resume:
-            texte = QPlainTextEdit(resume)
-            texte.setReadOnly(True)
-            v.addWidget(texte, 1)
-        v.addWidget(QLabel("Note"))
-        self._note = QPlainTextEdit(note)
-        self._note.setPlaceholderText("Pourquoi cette config ? Ce qu'il faut revérifier ?")
-        v.addWidget(self._note, 1)
-        boutons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
-                                   | QDialogButtonBox.StandardButton.Cancel)
-        boutons.accepted.connect(self.accept)
-        boutons.rejected.connect(self.reject)
-        v.addWidget(boutons)
-        self._note.setFocus()
-
-    def note(self):
-        return self._note.toPlainText().strip()
 
 
 class DialogueSymbole(QDialog):
@@ -297,7 +270,7 @@ class FenetrePrincipale(QMainWindow):
         corps.addWidget(self._panneau)
         corps.addWidget(self.onglets)
         corps.setStretchFactor(1, 1)
-        corps.setSizes([360, 1140])
+        corps.setSizes([440, 1060])
         self.setCentralWidget(corps)
 
         self.journal = QPlainTextEdit()
@@ -314,9 +287,11 @@ class FenetrePrincipale(QMainWindow):
         self.statusBar().addPermanentWidget(self.barre_progres)
 
         self._charger_symboles()
+        self._rafraichir_configs()
 
     def closeEvent(self, event):
         """Interrompt les calculs en cours et attend leurs threads avant de quitter."""
+        self._enregistrer_note()
         taches = list(self._labos_en_cours) + ([self._tache] if self._tache is not None else [])
         for tache in taches:
             tache.annuler()
@@ -427,11 +402,73 @@ class FenetrePrincipale(QMainWindow):
         self.bouton_analyser.setStyleSheet("font-weight: bold; padding: 8px;")
         self.bouton_analyser.clicked.connect(self._analyser)
 
+        self.onglets_gauche = QTabWidget()
+        self.onglets_gauche.addTab(scroll, "Paramètres")
+        self.onglets_gauche.addTab(self._construire_panneau_configs(), "Configs")
+        self.onglets_gauche.currentChanged.connect(
+            lambda i: self._rafraichir_configs() if i == 1 else None)
+
         self._panneau = QWidget()
         v = QVBoxLayout(self._panneau)
         v.setContentsMargins(0, 0, 0, 0)
-        v.addWidget(scroll, 1)
+        v.addWidget(self.onglets_gauche, 1)
         v.addWidget(self.bouton_analyser)
+
+    def _construire_panneau_configs(self):
+        """Configs sauvegardées, dans la sidebar : on prend ses notes sans quitter les tableaux."""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        boutons = QHBoxLayout()
+        for libelle, aide, action in (
+                ("Recharger", "Remet les paramètres de la config dans l'onglet Paramètres, sans "
+                              "lancer d'analyse.", self._recharger_config),
+                ("Copier", "Copie le résumé (avec la note) dans le presse-papiers.", self._copier_resume),
+                ("Supprimer", "Supprime la config de la base.", self._supprimer_config)):
+            bouton = QPushButton(libelle)
+            bouton.setToolTip(aide)
+            bouton.clicked.connect(action)
+            boutons.addWidget(bouton)
+        v.addLayout(boutons)
+
+        self.liste_configs = QListWidget()
+        self.liste_configs.setWordWrap(True)
+        self.liste_configs.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.liste_configs.setUniformItemSizes(False)
+        self.liste_configs.currentItemChanged.connect(self._config_choisie)
+        self.texte_config = QPlainTextEdit()
+        self.texte_config.setReadOnly(True)
+        self.texte_config.setPlaceholderText(
+            "Sauvegarde une config depuis l'onglet Criblage (bouton en bas à droite) : elle "
+            "apparaît ici, prête à recevoir une note.")
+        self.note_config = QPlainTextEdit()
+        self.note_config.setPlaceholderText("Note : pourquoi cette config, ce qu'il faut revérifier... "
+                                            "Enregistrée automatiquement.")
+        self.note_config.textChanged.connect(self._note_modifiee)
+        self._note_id = None               # config dont la note est dans l'éditeur
+        self._note_sale = False
+        self._timer_note = QTimer(self)
+        self._timer_note.setSingleShot(True)
+        self._timer_note.timeout.connect(self._enregistrer_note)
+
+        def bloc(titre, widget):
+            b = QWidget()
+            vb = QVBoxLayout(b)
+            vb.setContentsMargins(0, 0, 0, 0)
+            vb.addWidget(QLabel(titre))
+            vb.addWidget(widget, 1)
+            return b
+
+        separateur = QSplitter(Qt.Orientation.Vertical)
+        separateur.addWidget(bloc("Configs sauvegardées", self.liste_configs))
+        separateur.addWidget(bloc("Résumé", self.texte_config))
+        separateur.addWidget(bloc("Note", self.note_config))
+        separateur.setSizes([260, 260, 200])
+        v.addWidget(separateur, 1)
+        base = QLabel(f"Base : {configs.chemin_base()}")
+        base.setWordWrap(True)
+        base.setStyleSheet("color: #888; font-size: 10px;")
+        v.addWidget(base)
+        return w
 
     def _charger_symboles(self):
         self.infos = data.lister_symboles()
@@ -677,20 +714,22 @@ class FenetrePrincipale(QMainWindow):
         self.table_pol = _tableau([
             "Politique de sortie", "Rend. %", "DD %", "Sharpe", "PF", "Réussite %", "Trades",
             "Rend/DD", "Via stop", "Levier", "P(réussite)", "Témoin", "Gain (pts)",
-            "Trailing BotX %", "Risque BotX %"], etirer=False)
+            "Stop BotX", "Risque BotX %"], etirer=False)
         self.table_ls = _tableau([
             "Variante", "Rend. %", "DD %", "Sharpe", "PF", "Longs", "Shorts", "Trades",
-            "Rend/DD", "Via stop", "Levier", "P(réussite)", "Trailing BotX %", "Risque BotX %"],
+            "Rend/DD", "Via stop", "Levier", "P(réussite)", "Stop BotX", "Risque BotX %"],
             etirer=False)
         for table in (self.table_pol, self.table_ls):
             n = table.columnCount()
             table.horizontalHeaderItem(n - 2).setToolTip(
-                "TrailingStopPct à saisir dans BotX (0 = sans stop). Seuls le croisement seul et "
-                "le trailing en % sont transposables : le stop ATR du simulateur est fixe, le mode "
-                "ATR de BotX est un trailing.")
+                "Réglage BotX équivalent : Percent (trailing en %, 0 = sans stop) ou AtrFixed "
+                "(stop ATR statique). « non transp. » : la target 1:2 n'a pas de take profit dans "
+                "BotX.")
             table.horizontalHeaderItem(n - 1).setToolTip(
-                "RiskPerTradePct à saisir dans BotX pour retrouver le levier de la ligne. "
-                "Avec un trailing de T % : levier x T. Sans stop : 100 x levier.")
+                "RiskPerTradePct à saisir dans BotX pour retrouver le levier de la ligne. Trailing "
+                "de T % : levier x T. Sans stop : 100 x levier. AtrFixed (~) : levier x distance "
+                "médiane du stop à l'entrée, approximatif car BotX garde le risque constant et "
+                "laisse le notionnel varier.")
         self.combo_ls_politique = QComboBox()
         self.combo_ls_politique.addItems(labo.noms_politiques())
         self.combo_ls_politique.setToolTip("Politique de sortie appliquée aux deux directions.")
@@ -701,10 +740,11 @@ class FenetrePrincipale(QMainWindow):
             "ou le trailing plutôt que par le croisement (0 = il ne s'est jamais déclenché, la "
             "ligne est alors identique au croisement seul). Gain = P(réussite) moins celle d'un "
             "témoin sans edge, de même volatilité et de même dérive que l'actif, au levier qui "
-            "maximise ce gain. Les deux dernières colonnes donnent les paramètres BotX qui "
-            "reproduisent la ligne : TrailingStopPct, et RiskPerTradePct = levier x trailing "
-            "(sans stop : 100 x levier). Les stops ATR ne sont pas transposables : ils sont fixes "
-            "ici, alors que le mode ATR de BotX est un trailing.")), "Croisement / stop / trailing")
+            "maximise ce gain. Les deux dernières colonnes donnent les réglages BotX qui reproduisent "
+            "la ligne : le stop (Percent ou AtrFixed) et RiskPerTradePct (levier x trailing ; sans "
+            "stop 100 x levier ; en AtrFixed levier x distance médiane du stop, approximatif). Les "
+            "lignes avec target 1:2 ne sont pas transposables : BotX n'a pas de take profit. "
+            "Le mode Atr de BotX (trailing) ne correspond à aucune ligne.")), "Croisement / stop / trailing")
         panneau_ls = self._panneau_labo(self.table_ls, (
             "Reproduit le comportement de BotX : le long s'ouvre sur le croisement haussier de la "
             "moyenne d'entrée ; le croisement baissier de la moyenne de sortie ferme le long et "
@@ -721,9 +761,9 @@ class FenetrePrincipale(QMainWindow):
         choix.addStretch(1)
         panneau_ls.layout().insertLayout(0, choix)
         self.onglets_labo.addTab(panneau_ls, "Long / short")
-        self.bouton_sauver = QPushButton("Sauvegarder cette config...")
+        self.bouton_sauver = QPushButton("Sauvegarder cette config")
         self.bouton_sauver.setToolTip(
-            "Enregistre dans la base DuckDB, avec une note : la paire sélectionnée, le filtre de "
+            "Enregistre dans la base DuckDB (la note se prend ensuite dans la sidebar, onglet Configs) : la paire sélectionnée, le filtre de "
             "tendance, et l'onglet de détail affiché : politique de sortie (long seul) ou "
             "variante long/short avec sa politique. Sans ligne sélectionnée, la première.")
         self.bouton_sauver.clicked.connect(self._sauvegarder_config)
@@ -825,37 +865,6 @@ class FenetrePrincipale(QMainWindow):
         v.addWidget(self.label_cmp)
         v.addWidget(self.vue_cmp, 1)
         self.onglets.addTab(w, ONGLETS[T_COMPARAISON])
-
-        # Configs sauvegardées
-        w = QWidget()
-        v = QVBoxLayout(w)
-        h = QHBoxLayout()
-        for libelle, action in (("Modifier la note", self._modifier_note),
-                                ("Recharger les paramètres", self._recharger_config),
-                                ("Copier le résumé", self._copier_resume),
-                                ("Supprimer", self._supprimer_config)):
-            bouton = QPushButton(libelle)
-            bouton.clicked.connect(action)
-            h.addWidget(bouton)
-        h.addStretch(1)
-        h.addWidget(QLabel(f"Base : {configs.chemin_base()}"))
-        self.table_configs = _tableau([
-            "#", "Date", "Note", "Symbole", "Période", "Paire", "Tendance", "Sortie", "Direction",
-            "Rend. %", "P(réussite)", "Levier"], etirer=False)
-        self.table_configs.itemSelectionChanged.connect(self._afficher_resume_config)
-        self.table_configs.itemDoubleClicked.connect(lambda _: self._modifier_note())
-        self.texte_config = QPlainTextEdit()
-        self.texte_config.setReadOnly(True)
-        self.texte_config.setMaximumHeight(210)
-        self.texte_config.setPlaceholderText(
-            "Sauvegarde une config depuis l'onglet Criblage, puis retrouve-la ici. "
-            "Recharger remet ses paramètres dans le panneau de gauche : reste à cliquer sur Analyser.")
-        v.addLayout(h)
-        v.addWidget(self.table_configs, 1)
-        v.addWidget(self.texte_config)
-        self.onglets.addTab(w, ONGLETS[T_CONFIGS])
-        self.onglets.currentChanged.connect(
-            lambda i: self._rafraichir_configs() if i == T_CONFIGS else None)
 
     # -------------------------------------------------------------- analyse
 
@@ -1238,11 +1247,11 @@ class FenetrePrincipale(QMainWindow):
             "meilleur_levier": lev, "meilleur_p": meilleur_p if ligne.p_reussite else None,
             "hasard": p.regles.hasard_pur()}}
         if pol is not None:
-            metriques["politique"] = {**asdict(pol), "trailing_botx": pol.trailing_botx,
+            metriques["politique"] = {**asdict(pol), "botx_params": pol.parametres_botx,
                                       "risque_botx": pol.risque_botx}
         if ls is not None:
             metriques["direction"] = {**asdict(ls), "politique": self.combo_ls_politique.currentText(),
-                                      "trailing_botx": ls.trailing_botx, "risque_botx": ls.risque_botx}
+                                      "botx_params": ls.parametres_botx, "risque_botx": ls.risque_botx}
         return configs.Config(
             note="", symbole=sym, unite=p.unite, debut=p.debut, fin=p.fin, entree_type=e,
             sortie_type=s, rapide=p.rapide, lente=p.lente, tendance=r.tendance,
@@ -1255,79 +1264,107 @@ class FenetrePrincipale(QMainWindow):
             metriques=metriques)
 
     def _sauvegarder_config(self):
+        """Enregistre tout de suite (sans boîte modale qui cacherait les tableaux) et ouvre la
+        config dans la sidebar, curseur dans la note."""
         config = self._config_courante()
         if config is None:
             QMessageBox.information(self, "Configs", "Sélectionne d'abord une ligne du criblage.")
             return
-        dialogue = DialogueNote("Sauvegarder cette config", configs.resume(config), parent=self)
-        if not dialogue.exec():
-            return
         try:
-            id_config = configs.sauvegarder(replace(config, note=dialogue.note()))
+            id_config = configs.sauvegarder(config)
         except Exception as e:
             QMessageBox.warning(self, "Configs", f"Sauvegarde impossible : {e}")
             return
-        self.statusBar().showMessage(f"Config #{id_config} sauvegardée.", 6000)
+        self._rafraichir_configs(selectionner=id_config)
+        self.onglets_gauche.setCurrentIndex(1)
+        self.note_config.setFocus()
+        self.statusBar().showMessage(f"Config #{id_config} sauvegardée : ajoute une note dans la sidebar.", 8000)
 
-    def _rafraichir_configs(self):
-        t = self.table_configs
-        t.setRowCount(0)
+    @staticmethod
+    def _libelle_config(c):
+        cr = c.metriques.get("crible", {})
+        p = (f"{cr['meilleur_p'] * 100:.0f} % x{cr['meilleur_levier']:g}"
+             if cr.get("meilleur_p") is not None else "-")
+        note = c.note.strip().splitlines()[0] if c.note.strip() else "(sans note)"
+        return (f"#{c.id} · {c.symbole} {c.unite.upper()} · {p}\n"
+                f"{c.entree_type}→{c.sortie_type} {c.rapide}/{c.lente}\n{note}")
+
+    def _rafraichir_configs(self, selectionner=None):
+        self._enregistrer_note()
+        courante = self._config_selectionnee()
+        cible = selectionner if selectionner is not None else (courante.id if courante else None)
+        self.liste_configs.blockSignals(True)
+        self.liste_configs.clear()
         try:
             self._configs = {c.id: c for c in configs.lister()}
         except Exception as e:
             self._configs = {}
+            self.liste_configs.blockSignals(False)
             self.texte_config.setPlainText(f"Base illisible : {e}")
+            self._charger_note(None)
             return
         for c in self._configs.values():
-            cr = c.metriques.get("crible", {})
-            i = t.rowCount()
-            t.insertRow(i)
-            note = c.note.strip().splitlines()[0] if c.note.strip() else ""
-            cellules = [
-                _Num(str(c.id), c.id), QTableWidgetItem(f"{c.cree_le:%d/%m/%Y %H:%M}"),
-                QTableWidgetItem(note if len(note) <= 60 else note[:59] + "…"),
-                QTableWidgetItem(c.symbole),
-                QTableWidgetItem(f"{c.unite.upper()} {_jour(c.debut)} -> {_jour(c.fin)}"),
-                QTableWidgetItem(f"{c.entree_type} → {c.sortie_type} {c.rapide}/{c.lente}"),
-                QTableWidgetItem(c.tendance.libelle().removeprefix("tendance : ")),
-                QTableWidgetItem(c.politique), QTableWidgetItem(c.direction),
-                _Num(_n(cr.get("rendement_pct"), "+.1f"), cr.get("rendement_pct"),
-                     _signe(cr.get("rendement_pct"))),
-                _Num(f"{cr['meilleur_p'] * 100:.0f} %" if cr.get("meilleur_p") is not None else "-",
-                     cr.get("meilleur_p")),
-                _Num(f"x{cr['meilleur_levier']:g}" if cr.get("meilleur_p") is not None else "-",
-                     cr.get("meilleur_levier")),
-            ]
-            cellules[2].setToolTip(c.note)
-            for j, cellule in enumerate(cellules):
-                t.setItem(i, j, cellule)
-            t.item(i, 0).setData(Qt.ItemDataRole.UserRole, c.id)
-        if t.rowCount():
-            t.selectRow(0)
-        else:
-            self.texte_config.clear()
+            item = QListWidgetItem(self._libelle_config(c))
+            item.setSizeHint(QSize(0, 3 * self.liste_configs.fontMetrics().lineSpacing() + 12))
+            item.setData(Qt.ItemDataRole.UserRole, c.id)
+            item.setToolTip(c.note)
+            self.liste_configs.addItem(item)
+            if c.id == cible:
+                self.liste_configs.setCurrentItem(item)
+        if self.liste_configs.currentItem() is None and self.liste_configs.count():
+            self.liste_configs.setCurrentRow(0)
+        self.liste_configs.blockSignals(False)
+        self._config_choisie()
+
+    def _config_choisie(self, *_):
+        self._enregistrer_note()              # la note de la config qu'on quitte
+        c = self._config_selectionnee()
+        self.texte_config.setPlainText(configs.resume(c) if c else "")
+        self._charger_note(c)
+
+    def _charger_note(self, c):
+        self.note_config.blockSignals(True)
+        self.note_config.setPlainText(c.note if c else "")
+        self.note_config.blockSignals(False)
+        self.note_config.setEnabled(c is not None)
+        self._note_id = c.id if c else None
+        self._note_sale = False
+
+    def _note_modifiee(self):
+        self._note_sale = True
+        self._timer_note.start(700)          # enregistre quand la frappe se calme
+
+    def _enregistrer_note(self):
+        self._timer_note.stop()
+        if not self._note_sale or self._note_id is None:
+            return
+        self._note_sale = False
+        texte = self.note_config.toPlainText().strip()
+        c = self._configs.get(self._note_id)
+        try:
+            configs.modifier_note(self._note_id, texte)
+        except Exception as e:
+            self.statusBar().showMessage(f"Note non enregistrée : {e}", 8000)
+            self._note_sale = True
+            return
+        if c is not None:
+            c = replace(c, note=texte)
+            self._configs[c.id] = c
+            for i in range(self.liste_configs.count()):
+                item = self.liste_configs.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == c.id:
+                    item.setText(self._libelle_config(c))
+                    item.setToolTip(c.note)
+            actuelle = self._config_selectionnee()
+            if actuelle is not None and actuelle.id == c.id:
+                self.texte_config.setPlainText(configs.resume(c))
 
     def _config_selectionnee(self):
-        rangs = self.table_configs.selectionModel().selectedRows()
-        if not rangs:
-            return None
-        return self._configs.get(self.table_configs.item(rangs[0].row(), 0).data(Qt.ItemDataRole.UserRole))
-
-    def _afficher_resume_config(self):
-        c = self._config_selectionnee()
-        if c is not None:
-            self.texte_config.setPlainText(configs.resume(c))
-
-    def _modifier_note(self):
-        c = self._config_selectionnee()
-        if c is None:
-            return
-        dialogue = DialogueNote(f"Note de la config #{c.id}", note=c.note, parent=self)
-        if dialogue.exec():
-            configs.modifier_note(c.id, dialogue.note())
-            self._rafraichir_configs()
+        item = self.liste_configs.currentItem()
+        return self._configs.get(item.data(Qt.ItemDataRole.UserRole)) if item is not None else None
 
     def _copier_resume(self):
+        self._enregistrer_note()
         c = self._config_selectionnee()
         if c is not None:
             QApplication.clipboard().setText(configs.resume(c))
@@ -1340,6 +1377,7 @@ class FenetrePrincipale(QMainWindow):
         Bouton = QMessageBox.StandardButton
         if QMessageBox.question(self, "Supprimer", f"Supprimer la config #{c.id} ({c.symbole}) ?",
                                 Bouton.Yes | Bouton.No, Bouton.No) == Bouton.Yes:
+            self._note_sale = False
             configs.supprimer(c.id)
             self._rafraichir_configs()
 
@@ -1379,6 +1417,7 @@ class FenetrePrincipale(QMainWindow):
                 self.table_couts.item(i, 1).setText(f"{cts['commission_par_lot_par_cote']:g}")
                 self.table_couts.item(i, 2).setText(f"{cts['taille_contrat']:g}")
         self._a_restaurer = (c.symbole, c.entree_type, c.sortie_type)
+        self.onglets_gauche.setCurrentIndex(0)          # les paramètres rechargés, à ajuster
         self.statusBar().showMessage(
             "Paramètres rechargés : clique sur Analyser pour retrouver cette config.", 10000)
 
