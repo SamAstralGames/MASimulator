@@ -98,6 +98,23 @@ def signaux(close, entree_type, sortie_type, rapide, lente, cache=None):
     return entrees, sorties
 
 
+def signaux_long_short(close, entree_type, sortie_type, rapide, lente, cache=None):
+    """(entrée haussière, sortie baissière, sortie haussière), comme les lit BotX :
+    l'entrée d'un long vient de la moyenne d'entrée, tout le reste (fermer un long,
+    ouvrir un short, fermer un short) de la moyenne de SORTIE."""
+    cache = cache if cache is not None else {}
+
+    def position(nom):
+        cle = (nom, rapide, lente)
+        if cle not in cache:
+            cache[cle] = moyennes.rapide_au_dessus(close, nom, rapide, lente)
+        return cache[cle]
+
+    return (moyennes.croisement_haussier(*position(entree_type)),
+            moyennes.croisement_baissier(*position(sortie_type)),
+            moyennes.croisement_haussier(*position(sortie_type)))
+
+
 def nouvelle_config(fees, slippage, capital=10_000.0):
     return raptorbt.BacktestConfig(
         initial_capital=capital, fees=fees, slippage=slippage,

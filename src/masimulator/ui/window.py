@@ -666,7 +666,11 @@ class FenetrePrincipale(QMainWindow):
             "Rend/DD", "Via stop", "Levier", "P(réussite)", "Témoin", "Gain (pts)"], etirer=False)
         self.table_ls = _tableau([
             "Variante", "Rend. %", "DD %", "Sharpe", "PF", "Longs", "Shorts", "Trades",
-            "Rend/DD", "Levier", "P(réussite)"], etirer=False)
+            "Rend/DD", "Via stop", "Levier", "P(réussite)"], etirer=False)
+        self.combo_ls_politique = QComboBox()
+        self.combo_ls_politique.addItems(labo.noms_politiques())
+        self.combo_ls_politique.setToolTip("Politique de sortie appliquée aux deux directions.")
+        self.combo_ls_politique.currentIndexChanged.connect(lambda _: self._lancer_labo(True))
         self.onglets_labo = QTabWidget()
         self.onglets_labo.addTab(self._panneau_labo(self.table_pol, (
             "Mêmes entrées partout, seule la sortie change. Via stop = trades sortis par le stop "
@@ -674,16 +678,26 @@ class FenetrePrincipale(QMainWindow):
             "ligne est alors identique au croisement seul). Gain = P(réussite) moins celle d'un "
             "témoin sans edge, de même volatilité et de même dérive que l'actif, au levier qui "
             "maximise ce gain.")), "Croisement / stop / trailing")
-        self.onglets_labo.addTab(self._panneau_labo(self.table_ls, (
-            "Long seul, short seul, long + short (retournement). Les lignes « tendance » ne "
-            "prennent un long qu'avec la tendance de fond et un short qu'à contre (filtre à "
-            "configurer ci-dessus). Levier = celui qui maximise la P(réussite). Pas de témoin : "
-            "la dérive de l'actif joue contre un short.")), "Long / short")
+        panneau_ls = self._panneau_labo(self.table_ls, (
+            "Reproduit le comportement de BotX : le long s'ouvre sur le croisement haussier de la "
+            "moyenne d'entrée ; le croisement baissier de la moyenne de sortie ferme le long et "
+            "ouvre le short (depuis le plat aussi) ; le short se ferme sur le croisement haussier "
+            "de la moyenne de sortie. Les lignes « tendance » ne prennent un long qu'avec la "
+            "tendance de fond et un short qu'à contre. Le retournement ferme puis rouvre une barre "
+            "plus tard (le moteur interdit les deux sur la même barre), BotX les fait sur la même. "
+            "Levier = celui qui maximise la P(réussite). Pas de témoin : la dérive de l'actif joue "
+            "contre un short."))
+        choix = QHBoxLayout()
+        choix.addWidget(QLabel("Politique de sortie"))
+        choix.addWidget(self.combo_ls_politique)
+        choix.addStretch(1)
+        panneau_ls.layout().insertLayout(0, choix)
+        self.onglets_labo.addTab(panneau_ls, "Long / short")
         self.bouton_sauver = QPushButton("Sauvegarder cette config...")
         self.bouton_sauver.setToolTip(
             "Enregistre dans la base DuckDB, avec une note : la paire sélectionnée, le filtre de "
-            "tendance, et la ligne sélectionnée dans chaque onglet de détail (par défaut : "
-            "croisement seul, long seul).")
+            "tendance, et l'onglet de détail affiché : politique de sortie (long seul) ou "
+            "variante long/short avec sa politique. Sans ligne sélectionnée, la première.")
         self.bouton_sauver.clicked.connect(self._sauvegarder_config)
         bas = QWidget()
         vb = QVBoxLayout(bas)
@@ -1182,8 +1196,13 @@ class FenetrePrincipale(QMainWindow):
         r, p = self.resultats[sym], self.params
         ligne = next(l for l in r.lignes if (l.entree_type, l.sortie_type) == (e, s))
         lev, meilleur_p = ligne.meilleur_levier()
-        pol = self._ligne_labo_selectionnee(self.table_pol, self._labo_lignes[0])
-        ls = self._ligne_labo_selectionnee(self.table_ls, self._labo_lignes[1])
+        # Une config = une seule stratégie : l'onglet de détail affiché dit laquelle.
+        en_long_short = self.onglets_labo.currentIndex() == 1
+        pol = ls = None
+        if en_long_short:
+            ls = self._ligne_labo_selectionnee(self.table_ls, self._labo_lignes[1])
+        else:
+            pol = self._ligne_labo_selectionnee(self.table_pol, self._labo_lignes[0])
         metriques = {"crible": {
             "n_trades": ligne.n_trades, "rendement_pct": ligne.rendement_pct,
             "dd_pct": ligne.dd_pct, "sharpe": ligne.sharpe, "win_rate_pct": ligne.win_rate_pct,
@@ -1193,11 +1212,12 @@ class FenetrePrincipale(QMainWindow):
         if pol is not None:
             metriques["politique"] = asdict(pol)
         if ls is not None:
-            metriques["direction"] = asdict(ls)
+            metriques["direction"] = {**asdict(ls), "politique": self.combo_ls_politique.currentText()}
         return configs.Config(
             note="", symbole=sym, unite=p.unite, debut=p.debut, fin=p.fin, entree_type=e,
             sortie_type=s, rapide=p.rapide, lente=p.lente, tendance=r.tendance,
-            politique=pol.nom if pol else "croisement seul",
+            politique=self.combo_ls_politique.currentText() if en_long_short
+            else (pol.nom if pol else "croisement seul"),
             direction=ls.nom if ls else "long seul",
             parametres={"regles": asdict(p.regles), "capital": p.capital,
                         "leviers": list(p.leviers), "n_departs": p.n_departs,
@@ -1337,18 +1357,24 @@ class FenetrePrincipale(QMainWindow):
     def _planifier_labo(self):
         self._timer_labo.start(250)       # évite de recalculer à chaque flèche du clavier
 
-    def _lancer_labo(self):
+    def _lancer_labo(self, partiel=False):
+        """Calcule les détails de la paire sélectionnée. `partiel` : seul l'onglet long / short
+        (le sélecteur de politique a changé), les sorties long seul restent affichées."""
         paire = self._paire_selectionnee()
         if paire is None or self.params is None:
             return
         sym, e, s = paire
         r, p = self.resultats[sym], self.params
-        cle = (sym, e, s, id(r.lignes), r.tendance)
+        politique = self.combo_ls_politique.currentText()
+        cle = (sym, e, s, id(r.lignes), r.tendance, politique)
+        if partiel and cle[:5] != (self._labo_cle or (None,) * 6)[:5]:
+            partiel = False                # autre paire depuis : tout recalculer
         self._labo_cle = cle
         for tache in self._labos_en_cours:
             tache.annuler()
-        self._labo_lignes = ([], [])
-        self.table_pol.setRowCount(0)
+        if not partiel:
+            self._labo_lignes = ([], [])
+            self.table_pol.setRowCount(0)
         self.table_ls.setRowCount(0)
         self.label_labo.setText(f"{sym} · {e} → {s} · {p.rapide}/{p.lente} · "
                                 f"{r.tendance.libelle()}   (calcul en cours...)")
@@ -1356,11 +1382,14 @@ class FenetrePrincipale(QMainWindow):
 
         def travail(progres, annule, journal):
             entrees, sorties = engine.signaux(b.close, e, s, p.rapide, p.lente)
-            filtrees = entrees & haussiere if haussiere is not None else entrees
-            pol = labo.comparer_sorties(b, filtrees, sorties, couts, p.regles, p.leviers,
-                                        p.n_departs, p.capital, annule)
-            ls = labo.comparer_long_short(b, entrees, sorties, couts, p.regles, p.leviers,
-                                          p.n_departs, p.capital, haussiere, annule)
+            pol = None
+            if not partiel:
+                filtrees = entrees & haussiere if haussiere is not None else entrees
+                pol = labo.comparer_sorties(b, filtrees, sorties, couts, p.regles, p.leviers,
+                                            p.n_departs, p.capital, annule)
+            signaux = engine.signaux_long_short(b.close, e, s, p.rapide, p.lente)
+            ls = labo.comparer_long_short(b, signaux, couts, p.regles, p.leviers, p.n_departs,
+                                          p.capital, haussiere, politique, annule)
             return pol, ls
 
         tache = Tache(travail, self)
@@ -1383,8 +1412,11 @@ class FenetrePrincipale(QMainWindow):
     def _afficher_labo(self, cle, b, pol, ls):
         sym, e, s = cle[:3]
         p = self.params
+        if pol is None:                    # mise à jour partielle : on garde les sorties long seul
+            pol = self._labo_lignes[0]
         self._labo_lignes = (pol, ls)
-        self.label_labo.setText(f"{sym} · {e} → {s} · {p.rapide}/{p.lente} · {cle[4].libelle()}")
+        self.label_labo.setText(f"{sym} · {e} → {s} · {p.rapide}/{p.lente} · {cle[4].libelle()}"
+                                f" · long/short : {cle[5]}")
         bh_rend, bh_dd = labo.buy_and_hold(b.close)
 
         def remplir(table, lignes, colonnes_fn, col_rend_dd):
@@ -1428,7 +1460,8 @@ class FenetrePrincipale(QMainWindow):
         def ligne_ls(l):
             return [QTableWidgetItem(l.nom), *commun(l), _Num(str(l.n_longs), l.n_longs),
                     _Num(str(l.n_shorts), l.n_shorts), _Num(str(l.n_trades), l.n_trades),
-                    _Num(_n(l.rend_dd, ".2f"), l.rend_dd), *lev_p(l)]
+                    _Num(_n(l.rend_dd, ".2f"), l.rend_dd),
+                    _Num(f"{l.via_stop}/{l.n_trades}", l.via_stop), *lev_p(l)]
 
         remplir(self.table_pol, pol, ligne_pol, 7)
         remplir(self.table_ls, ls, ligne_ls, 8)

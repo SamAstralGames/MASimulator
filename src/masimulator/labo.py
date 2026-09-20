@@ -84,6 +84,15 @@ def _ligne(nom, res, b, regles, leviers, n_departs, avec_temoin, **extra):
         n_trades=int(m["total_trades"] or 0), **champs, **extra)
 
 
+def _via_stop(res):
+    """Trades sortis par un stop, un trailing ou une target plutôt que par le croisement.
+
+    total_trades compte les entrées, pas le mécanisme de sortie : seule la RAISON de
+    sortie dit si le stop a réellement coupé avant le signal.
+    """
+    return sum(t.raison_sortie in ("StopLoss", "TakeProfit") for t in res.trades)
+
+
 def politiques(fees, slippage, capital):
     """{nom: config} : la référence (croisement seul), les stops ATR, les trailings.
 
@@ -116,71 +125,95 @@ def comparer_sorties(b: Bougies, entrees, sorties, couts: engine.Couts, regles, 
         if annule is not None and annule():
             break
         res = engine.backtest(b, entrees, sorties, fees, slippage, capital, config=config)
-        # total_trades compte les entrées, pas le mécanisme de sortie : seule la
-        # RAISON de sortie dit si le stop/trailing a réellement coupé avant le signal.
-        via_stop = sum(t.raison_sortie != "Signal" for t in res.trades)
-        lignes.append(_ligne(nom, res, b, regles, leviers, n_departs, True, via_stop=via_stop))
+        lignes.append(_ligne(nom, res, b, regles, leviers, n_departs, True,
+                             via_stop=_via_stop(res)))
     return lignes
 
 
 class _StrategieLongShort(raptorbt.Strategy):
-    """Long/short piloté par deux signaux déjà calculés.
+    """Long/short tel que BotX le pratique, pour que ce qu'on mesure soit ce que le bot fera.
 
-    signal_haut ouvre un long (ou retourne un short en long), signal_bas ouvre un
-    short (ou retourne un long en short). Le moteur interdit de fermer et rouvrir
-    sur la même barre : on ferme, puis on entre à la barre suivante (`en_attente`).
-    `haussiere` (booléen, True = tendance haussière) n'autorise le long qu'avec la
-    tendance et le short qu'à contre : jamais de position contre la tendance de fond.
+    - long : ouvert sur le croisement haussier de la moyenne d'ENTRÉE, fermé sur le
+      croisement baissier de la moyenne de SORTIE ;
+    - short : ouvert sur ce même croisement baissier de sortie (depuis un long, c'est le
+      retournement ; depuis le plat aussi), fermé sur le croisement HAUSSIER de la moyenne
+      de sortie, jamais celle d'entrée ;
+    - un croisement d'entrée pendant un long est ignoré ;
+    - le filtre de tendance ne bloque que les ouvertures (long avec la tendance, short à
+      contre) ; les sorties marchent toujours ;
+    - stops, trailing et target viennent de la config du backtest, appliqués par le noyau
+      aux deux directions.
+
+    Écart connu avec BotX : le moteur interdit de fermer et d'ouvrir sur la même barre.
+    Un retournement ferme à la barre suivante et rouvre une barre plus tard, alors que BotX
+    ferme et ouvre sur la même barre.
     """
 
-    def __init__(self, signal_haut, signal_bas, autoriser_long, autoriser_short,
-                 haussiere=None, taille=0.95):
+    def __init__(self, entree_haussiere, sortie_baissiere, sortie_haussiere, autoriser_long,
+                 autoriser_short, haussiere=None, taille=1.0):
         super().__init__()
-        self.haut, self.bas = np.asarray(signal_haut, bool), np.asarray(signal_bas, bool)
+        self.entree_haut = np.asarray(entree_haussiere, bool)
+        self.sortie_bas = np.asarray(sortie_baissiere, bool)
+        self.sortie_haut = np.asarray(sortie_haussiere, bool)
         self.long_ok, self.short_ok = autoriser_long, autoriser_short
         self.haussiere = None if haussiere is None else np.asarray(haussiere, bool)
         self.taille = taille
-        self.en_attente = None
+        self.en_attente = None       # sens à ouvrir dès que la position en cours est fermée
 
-    def _autorise(self, sens, i):
-        if not (self.long_ok if sens == 1 else self.short_ok):
-            return False
-        if self.haussiere is None:
-            return True
-        return bool(self.haussiere[i]) == (sens == 1)
+    def _tendance_ok(self, sens, i):
+        return self.haussiere is None or bool(self.haussiere[i]) == (sens == 1)
 
-    def _entrer(self, sens):
+    def _decider_ouverture(self, i):
+        """Sens à ouvrir à la barre i depuis le plat, ou 0."""
+        if self.entree_haut[i] and self.long_ok and self._tendance_ok(1, i):
+            return 1
+        if self.sortie_bas[i] and self.short_ok and self._tendance_ok(-1, i):
+            return -1
+        return 0
+
+    def _ouvrir(self, sens):
         if sens == 1:
             self.enter_long(size_frac=self.taille)
         else:
             self.enter_short(size_frac=self.taille)
 
     def on_bar(self, ctx):
-        if self.en_attente is not None and ctx.position is None:
-            sens, self.en_attente = self.en_attente, None
-            if self._autorise(sens, ctx.idx):
-                self._entrer(sens)
+        i, pos = ctx.idx, ctx.position
+        if self.en_attente is not None:
+            if pos is None:
+                sens, self.en_attente = self.en_attente, None
+                self._ouvrir(sens)
+            return                      # sinon la fermeture demandée n'est pas encore passée
+
+        if pos is None:
+            sens = self._decider_ouverture(i)
+            if sens:
+                self._ouvrir(sens)
             return
-        sens = 1 if self.haut[ctx.idx] else -1 if self.bas[ctx.idx] else 0
-        if not sens:
-            return
-        if ctx.position is not None:
+
+        if (pos.direction == 1 and self.sortie_bas[i]) or (pos.direction == -1 and self.sortie_haut[i]):
             self.close_position()
-            self.en_attente = sens
-        elif self._autorise(sens, ctx.idx):
-            self._entrer(sens)
+            self.en_attente = self._decider_ouverture(i) or None
 
 
-def comparer_long_short(b: Bougies, entrees, sorties, couts: engine.Couts, regles, leviers,
-                        n_departs=300, capital=10_000.0, haussiere=None, annule=None):
+def noms_politiques():
+    """Les noms des politiques de sortie, dans l'ordre d'affichage."""
+    return list(politiques(0.0, 0.0, 10_000.0))
+
+
+def comparer_long_short(b: Bougies, signaux, couts: engine.Couts, regles, leviers,
+                        n_departs=300, capital=10_000.0, haussiere=None,
+                        politique="croisement seul", annule=None):
     """Long seul, short seul, long + short ; avec et sans filtre de tendance si `haussiere`.
 
-    `entrees` / `sorties` sont les signaux BRUTS (non filtrés) : le filtre est appliqué
-    à l'intérieur de la stratégie, direction par direction.
+    `signaux` = engine.signaux_long_short(...) (bruts, non filtrés : le filtre s'applique
+    dans la stratégie, direction par direction). `politique` : une clé de `politiques()`
+    (croisement seul, stop ATR, trailing...), appliquée aux deux directions.
     Pas de témoin ici : la dérive de l'actif joue contre un short, un témoin à dérive
     long-only serait trompeur.
     """
     fees, slippage = couts.fractions(float(np.median(b.close)))
+    config_de = lambda: politiques(fees, slippage, capital)[politique]
     variantes = [("long seul", True, False, None), ("short seul", False, True, None),
                  ("long + short", True, True, None)]
     if haussiere is not None:
@@ -192,14 +225,15 @@ def comparer_long_short(b: Bougies, entrees, sorties, couts: engine.Couts, regle
         if annule is not None and annule():
             break
         brut = raptorbt.run_strategy_backtest(
-            _StrategieLongShort(entrees, sorties, long_ok, short_ok, filtre),
+            _StrategieLongShort(*signaux, long_ok, short_ok, filtre),
             b.timestamps_ns(), b.open, b.high, b.low, b.close, b.volume,
-            symbol=b.symbole, config=engine.nouvelle_config(fees, slippage, capital),
+            symbol=b.symbole, config=config_de(),
             account_type="margin",      # un short est refusé, en silence, sur un compte cash
             leverage=1.0)
         res = engine.resultat_de(brut)
         lignes.append(_ligne(
             nom, res, b, regles, leviers, n_departs, False,
             n_longs=sum(t.direction == 1 for t in res.trades),
-            n_shorts=sum(t.direction == -1 for t in res.trades)))
+            n_shorts=sum(t.direction == -1 for t in res.trades),
+            via_stop=_via_stop(res)))
     return lignes

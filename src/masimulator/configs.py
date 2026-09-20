@@ -204,6 +204,7 @@ def resume(c: Config):
         d = m.get(cle)
         if d:
             levier = f", x{d['levier']:g}" if d.get("levier") is not None else ""
+            titre += f" (sortie {d['politique']})" if d.get("politique") else ""
             lignes.append(f"  {titre} « {d['nom']} » : {d['n_trades']} trades, "
                           f"{d['rendement_pct']:+.1f} %, DD {d['dd_pct']:.1f} %, "
                           f"P(réussite) {_pct(d.get('p_reussite'))}{levier}")
