@@ -208,6 +208,13 @@ def resume(c: Config):
             lignes.append(f"  {titre} « {d['nom']} » : {d['n_trades']} trades, "
                           f"{d['rendement_pct']:+.1f} %, DD {d['dd_pct']:.1f} %, "
                           f"P(réussite) {_pct(d.get('p_reussite'))}{levier}")
+            if d.get("risque_botx") is not None:
+                t = d["trailing_botx"]
+                lignes.append(f"    BotX : RiskPerTradePct {d['risque_botx']:.3g}, "
+                              + (f"TrailingStopPct {t:g}" if t else "TrailingStopPct 0 (sans stop)"))
+            elif d.get("levier") is not None:
+                lignes.append("    BotX : non transposable (le stop ATR du simulateur est fixe, "
+                              "le mode ATR de BotX est un trailing)")
     if c.note.strip():
         lignes.append(f"Note : {c.note.strip()}")
     return "\n".join(lignes)

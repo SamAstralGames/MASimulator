@@ -8,6 +8,7 @@ tout est renvoyé sous forme de lignes.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -36,10 +37,42 @@ class LigneLabo:
     p_reussite: float | None = None
     temoin: float | None = None
     gain: float | None = None          # P(réussite) - témoin, en fraction
+    politique: str | None = None       # politique de sortie de la ligne, clé de `politiques()`
 
     @property
     def rend_dd(self):
         return self.rendement_pct / self.dd_pct if self.dd_pct else None
+
+    @property
+    def trailing_botx(self):
+        """TrailingStopPct de BotX pour cette politique (0 = sans stop), None si non transposable."""
+        return trailing_botx(self.politique) if self.politique else None
+
+    @property
+    def risque_botx(self):
+        """RiskPerTradePct de BotX qui reproduit le levier de la ligne, None si non transposable.
+
+        Le levier de l'outil est une exposition (x1 = 100 % de l'equity en notionnel). BotX
+        dimensionne par le risque : avec un trailing de T %, R = levier x T ; sans stop il prend
+        R comme exposition brute en %, donc R = 100 x levier.
+        """
+        t = self.trailing_botx
+        if t is None or self.levier is None:
+            return None
+        return self.levier * t if t > 0 else self.levier * 100
+
+
+def trailing_botx(politique):
+    """TrailingStopPct de BotX équivalent à une politique de sortie.
+
+    Seuls le croisement seul (0 = stop désactivé) et le trailing en % sont transposables. Le
+    stop ATR de RaptorBT est FIXE (il reste à son niveau d'entrée), alors que le mode ATR de
+    BotX est un trailing qui suit le prix : ce n'est pas la même stratégie.
+    """
+    if politique == "croisement seul":
+        return 0.0
+    m = re.fullmatch(r"trailing ([\d.]+)%", politique or "")
+    return float(m.group(1)) if m else None
 
 
 def buy_and_hold(close):
@@ -126,7 +159,7 @@ def comparer_sorties(b: Bougies, entrees, sorties, couts: engine.Couts, regles, 
             break
         res = engine.backtest(b, entrees, sorties, fees, slippage, capital, config=config)
         lignes.append(_ligne(nom, res, b, regles, leviers, n_departs, True,
-                             via_stop=_via_stop(res)))
+                             via_stop=_via_stop(res), politique=nom))
     return lignes
 
 
@@ -235,5 +268,5 @@ def comparer_long_short(b: Bougies, signaux, couts: engine.Couts, regles, levier
             nom, res, b, regles, leviers, n_departs, False,
             n_longs=sum(t.direction == 1 for t in res.trades),
             n_shorts=sum(t.direction == -1 for t in res.trades),
-            via_stop=_via_stop(res)))
+            via_stop=_via_stop(res), politique=politique))
     return lignes

@@ -159,6 +159,18 @@ class _Num(QTableWidgetItem):
         return a < b
 
 
+def _cellules_botx(l):
+    """Cellules « Trailing BotX % » et « Risque BotX % » d'une ligne de détail."""
+    gris = QBrush(QColor("#999999"))
+    t, r = l.trailing_botx, l.risque_botx
+    if t is None:
+        if l.politique is None or l.levier is None:
+            return [_Num("-"), _Num("-")]
+        return [_Num("non transp.", brush=gris), _Num("non transp.", brush=gris)]
+    return [_Num(f"{t:g}" if t else "0 (aucun)", t),
+            _Num("-" if r is None else f"{r:.3g}", r)]
+
+
 def _fond_p(p):
     """Teinte bleue proportionnelle à une probabilité de réussite (0..1)."""
     return QBrush(QColor(0, 114, 178, int(min(max(p, 0.0), 1.0) * 150)))
@@ -664,10 +676,21 @@ class FenetrePrincipale(QMainWindow):
         self.label_labo.setStyleSheet("font-weight: bold;")
         self.table_pol = _tableau([
             "Politique de sortie", "Rend. %", "DD %", "Sharpe", "PF", "Réussite %", "Trades",
-            "Rend/DD", "Via stop", "Levier", "P(réussite)", "Témoin", "Gain (pts)"], etirer=False)
+            "Rend/DD", "Via stop", "Levier", "P(réussite)", "Témoin", "Gain (pts)",
+            "Trailing BotX %", "Risque BotX %"], etirer=False)
         self.table_ls = _tableau([
             "Variante", "Rend. %", "DD %", "Sharpe", "PF", "Longs", "Shorts", "Trades",
-            "Rend/DD", "Via stop", "Levier", "P(réussite)"], etirer=False)
+            "Rend/DD", "Via stop", "Levier", "P(réussite)", "Trailing BotX %", "Risque BotX %"],
+            etirer=False)
+        for table in (self.table_pol, self.table_ls):
+            n = table.columnCount()
+            table.horizontalHeaderItem(n - 2).setToolTip(
+                "TrailingStopPct à saisir dans BotX (0 = sans stop). Seuls le croisement seul et "
+                "le trailing en % sont transposables : le stop ATR du simulateur est fixe, le mode "
+                "ATR de BotX est un trailing.")
+            table.horizontalHeaderItem(n - 1).setToolTip(
+                "RiskPerTradePct à saisir dans BotX pour retrouver le levier de la ligne. "
+                "Avec un trailing de T % : levier x T. Sans stop : 100 x levier.")
         self.combo_ls_politique = QComboBox()
         self.combo_ls_politique.addItems(labo.noms_politiques())
         self.combo_ls_politique.setToolTip("Politique de sortie appliquée aux deux directions.")
@@ -678,7 +701,10 @@ class FenetrePrincipale(QMainWindow):
             "ou le trailing plutôt que par le croisement (0 = il ne s'est jamais déclenché, la "
             "ligne est alors identique au croisement seul). Gain = P(réussite) moins celle d'un "
             "témoin sans edge, de même volatilité et de même dérive que l'actif, au levier qui "
-            "maximise ce gain.")), "Croisement / stop / trailing")
+            "maximise ce gain. Les deux dernières colonnes donnent les paramètres BotX qui "
+            "reproduisent la ligne : TrailingStopPct, et RiskPerTradePct = levier x trailing "
+            "(sans stop : 100 x levier). Les stops ATR ne sont pas transposables : ils sont fixes "
+            "ici, alors que le mode ATR de BotX est un trailing.")), "Croisement / stop / trailing")
         panneau_ls = self._panneau_labo(self.table_ls, (
             "Reproduit le comportement de BotX : le long s'ouvre sur le croisement haussier de la "
             "moyenne d'entrée ; le croisement baissier de la moyenne de sortie ferme le long et "
@@ -686,8 +712,9 @@ class FenetrePrincipale(QMainWindow):
             "de la moyenne de sortie. Les lignes « tendance » ne prennent un long qu'avec la "
             "tendance de fond et un short qu'à contre. Le retournement ferme puis rouvre une barre "
             "plus tard (le moteur interdit les deux sur la même barre), BotX les fait sur la même. "
-            "Levier = celui qui maximise la P(réussite). Pas de témoin : la dérive de l'actif joue "
-            "contre un short."))
+            "Levier = celui qui maximise la P(réussite), et les deux dernières colonnes le traduisent "
+            "en paramètres BotX (voir l'onglet précédent). Pas de témoin : la dérive de l'actif "
+            "joue contre un short."))
         choix = QHBoxLayout()
         choix.addWidget(QLabel("Politique de sortie"))
         choix.addWidget(self.combo_ls_politique)
@@ -1211,9 +1238,11 @@ class FenetrePrincipale(QMainWindow):
             "meilleur_levier": lev, "meilleur_p": meilleur_p if ligne.p_reussite else None,
             "hasard": p.regles.hasard_pur()}}
         if pol is not None:
-            metriques["politique"] = asdict(pol)
+            metriques["politique"] = {**asdict(pol), "trailing_botx": pol.trailing_botx,
+                                      "risque_botx": pol.risque_botx}
         if ls is not None:
-            metriques["direction"] = {**asdict(ls), "politique": self.combo_ls_politique.currentText()}
+            metriques["direction"] = {**asdict(ls), "politique": self.combo_ls_politique.currentText(),
+                                      "trailing_botx": ls.trailing_botx, "risque_botx": ls.risque_botx}
         return configs.Config(
             note="", symbole=sym, unite=p.unite, debut=p.debut, fin=p.fin, entree_type=e,
             sortie_type=s, rapide=p.rapide, lente=p.lente, tendance=r.tendance,
@@ -1456,13 +1485,14 @@ class FenetrePrincipale(QMainWindow):
                     _Num(f"{l.via_stop}/{l.n_trades}", l.via_stop), *lev_p(l),
                     _Num(f"{l.temoin * 100:.0f} %" if l.temoin is not None else "-", l.temoin),
                     _Num(f"{round(gain * 100):+d}" if gain is not None else "-", gain,
-                         brush=QBrush(QColor("#009E73")) if gain is not None and gain > 0.05 else None)]
+                         brush=QBrush(QColor("#009E73")) if gain is not None and gain > 0.05 else None),
+                    *_cellules_botx(l)]
 
         def ligne_ls(l):
             return [QTableWidgetItem(l.nom), *commun(l), _Num(str(l.n_longs), l.n_longs),
                     _Num(str(l.n_shorts), l.n_shorts), _Num(str(l.n_trades), l.n_trades),
                     _Num(_n(l.rend_dd, ".2f"), l.rend_dd),
-                    _Num(f"{l.via_stop}/{l.n_trades}", l.via_stop), *lev_p(l)]
+                    _Num(f"{l.via_stop}/{l.n_trades}", l.via_stop), *lev_p(l), *_cellules_botx(l)]
 
         remplir(self.table_pol, pol, ligne_pol, 7)
         remplir(self.table_ls, ls, ligne_ls, 8)
