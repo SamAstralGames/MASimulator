@@ -24,17 +24,6 @@ LIBELLES_ISSUE = {
 }
 BLEU, ORANGE, GRIS = "#0072B2", "#E69F00", "#7f7f7f"
 
-# Métrique -> (libellé, extracteur, format, échelle de couleur, inverser l'échelle)
-METRIQUES = {
-    "p_best": "P(réussite), meilleur levier",
-    "p_levier": "P(réussite) au levier choisi",
-    "rendement": "Rendement (%)",
-    "dd": "Drawdown max (%)",
-    "sharpe": "Sharpe",
-    "trades": "Nombre de trades",
-}
-
-
 def _base(fig, titre=None):
     fig.update_layout(
         template="plotly_white", title=dict(text=titre, x=0.01) if titre else None,
@@ -60,60 +49,6 @@ def _decimer(y, n=5000):
     idx = np.concatenate([base + np.nanargmin(blocs, axis=1), base + np.nanargmax(blocs, axis=1),
                           [0, len(y) - 1]])
     return np.unique(idx)
-
-
-def _valeur(ligne, metrique, levier):
-    if metrique == "p_best":
-        return ligne.meilleur_levier()[1] * 100 if ligne.p_reussite else np.nan
-    if metrique == "p_levier":
-        p = ligne.p_reussite.get(levier)
-        return p * 100 if p is not None else np.nan
-    if metrique == "rendement":
-        return ligne.rendement_pct
-    if metrique == "dd":
-        return ligne.dd_pct
-    if metrique == "sharpe":
-        return ligne.sharpe if ligne.sharpe is not None else np.nan
-    return float(ligne.n_trades)
-
-
-def heatmap_crible(lignes, metrique="p_best", levier=1.0, regles=None):
-    """Matrice entrée (lignes) x sortie (colonnes) ; un clic donne (y=entrée, x=sortie)."""
-    types = moyennes.TYPES
-    z = np.full((len(types), len(types)), np.nan)
-    survol = [[""] * len(types) for _ in types]
-    idx = {t: i for i, t in enumerate(types)}
-    for l in lignes:
-        i, j = idx[l.entree_type], idx[l.sortie_type]
-        z[i, j] = _valeur(l, metrique, levier)
-        lev, p = l.meilleur_levier()
-        p_txt = f"{p * 100:.0f} % (levier {lev:g})" if l.p_reussite else "n/a (trop peu de trades)"
-        sharpe = f"{l.sharpe:.2f}" if l.sharpe is not None else "n/a"
-        survol[i][j] = (
-            f"<b>{l.entree_type} → {l.sortie_type}</b><br>"
-            f"trades : {l.n_trades}<br>rendement : {l.rendement_pct:+.1f} %<br>"
-            f"DD max : {l.dd_pct:.1f} %<br>Sharpe : {sharpe}<br>"
-            f"P(réussite) : {p_txt}")
-
-    est_p = metrique in ("p_best", "p_levier")
-    inverse = metrique == "dd"
-    fig = go.Figure(go.Heatmap(
-        z=z, x=list(types), y=list(types), customdata=survol,
-        hovertemplate="%{customdata}<extra></extra>",
-        colorscale="Blues_r" if inverse else "Blues",
-        zmin=0 if est_p else None, zmax=100 if est_p else None,
-        text=[[("" if np.isnan(v) else f"{v:.0f}" if est_p or metrique == "trades" else f"{v:.1f}")
-               for v in row] for row in z],
-        texttemplate="%{text}", xgap=2, ygap=2,
-        colorbar=dict(thickness=12, title=dict(text="%" if est_p else "")),
-    ))
-    fig.update_yaxes(title="Entrée (croisement haussier)", autorange="reversed")
-    fig.update_xaxes(title="Sortie (croisement baissier)", side="top")
-    titre = METRIQUES[metrique] + (f" (levier {levier:g})" if metrique == "p_levier" else "")
-    if est_p and regles is not None:
-        titre += f"   ·   hasard pur : {regles.hasard_pur() * 100:.0f} %"
-    return _base(fig, titre).update_layout(margin=dict(l=90, r=24, t=110, b=24),
-                                           title=dict(y=0.97, x=0.01))
 
 
 def figure_detail(b, res, entree_type, sortie_type, rapide, lente):

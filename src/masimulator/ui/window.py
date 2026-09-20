@@ -2,27 +2,28 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 import os
 
 import numpy as np
-from PySide6.QtCore import QDate, QSettings, Qt, QThread, Signal
+from PySide6.QtCore import QDate, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QTableWidget,
+    QInputDialog, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from .. import cli, data, engine, moyennes, propfirm
+from .. import cli, configs, data, engine, labo, moyennes, propfirm
+from .. import tendance as tend
 from . import charts
 from .webview import PlotlyView
 
-ONGLETS = ("Vue d'ensemble", "Criblage", "Détail", "Challenge", "Comparaison")
-T_APERCU, T_CRIBLE, T_DETAIL, T_CHALLENGE, T_COMPARAISON = range(5)
+ONGLETS = ("Vue d'ensemble", "Criblage", "Détail", "Challenge", "Comparaison", "Configs")
+T_APERCU, T_CRIBLE, T_DETAIL, T_CHALLENGE, T_COMPARAISON, T_CONFIGS = range(6)
 FRAICHEUR_MAX_JOURS = 7
 ROUGE = QBrush(QColor("#D55E00"))
 _AUCUNE = engine.LigneCrible("", "", 0, 0, 0, 0.0, 0.0, None, None, None)
@@ -48,6 +49,7 @@ class Params:
     couts: dict          # symbole -> (spread | None, commission, contrat)
     reglages: cli.Reglages
     telecharger: bool    # combler les trous du cache avec ctrader-cli
+    tendance: tend.Tendance
 
 
 @dataclass
@@ -57,6 +59,8 @@ class ResultatSymbole:
     couts: engine.Couts | None = None
     lignes: list = field(default_factory=list)
     erreur: str | None = None
+    tendance: tend.Tendance = tend.Tendance()
+    haussiere: np.ndarray | None = None       # True = tendance de fond haussière
 
     def meilleure(self):
         """Ligne au meilleur P(réussite) ; départage au rendement."""
@@ -77,6 +81,7 @@ class Detail:
     lente: int
     simulations: list      # une propfirm.Simulation par levier
     temoins: list
+    tendance: tend.Tendance
 
 
 class Tache(QThread):
@@ -94,6 +99,10 @@ class Tache(QThread):
 
     def annuler(self):
         self._annule = True
+
+    @property
+    def annulee(self):
+        return self._annule
 
     def run(self):
         try:
@@ -131,7 +140,39 @@ def _cellule(texte, droite=False, brush=None):
     return item
 
 
-def _tableau(colonnes):
+class _Num(QTableWidgetItem):
+    """Cellule numérique : s'affiche comme `texte`, se trie sur `valeur` (None = le plus petit)."""
+
+    def __init__(self, texte, valeur=None, brush=None, fond=None):
+        super().__init__(texte)
+        self._valeur = valeur
+        self.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if brush is not None:
+            self.setForeground(brush)
+        if fond is not None:
+            self.setBackground(fond)
+
+    def __lt__(self, autre):
+        a, b = self._valeur, getattr(autre, "_valeur", None)
+        if a is None or b is None:
+            return a is None and b is not None
+        return a < b
+
+
+def _fond_p(p):
+    """Teinte bleue proportionnelle à une probabilité de réussite (0..1)."""
+    return QBrush(QColor(0, 114, 178, int(min(max(p, 0.0), 1.0) * 150)))
+
+
+def _signe(valeur):
+    return ROUGE if valeur is not None and valeur < 0 else None
+
+
+def _n(v, fmt, defaut="n/a"):
+    return defaut if v is None or (isinstance(v, float) and np.isnan(v)) else format(v, fmt)
+
+
+def _tableau(colonnes, etirer=True):
     t = QTableWidget(0, len(colonnes))
     t.setHorizontalHeaderLabels(colonnes)
     t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -139,7 +180,7 @@ def _tableau(colonnes):
     t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     t.verticalHeader().setVisible(False)
     t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-    t.horizontalHeader().setStretchLastSection(True)
+    t.horizontalHeader().setStretchLastSection(etirer)
     return t
 
 
@@ -149,6 +190,33 @@ def _jour(t):
 
 def _retard_jours(date):
     return int((np.datetime64("today") - date.astype("datetime64[D]")) / np.timedelta64(1, "D"))
+
+
+class DialogueNote(QDialog):
+    """Saisie d'une note, avec en option le résumé de la config concernée."""
+
+    def __init__(self, titre, resume="", note="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(titre)
+        self.resize(560, 420)
+        v = QVBoxLayout(self)
+        if resume:
+            texte = QPlainTextEdit(resume)
+            texte.setReadOnly(True)
+            v.addWidget(texte, 1)
+        v.addWidget(QLabel("Note"))
+        self._note = QPlainTextEdit(note)
+        self._note.setPlaceholderText("Pourquoi cette config ? Ce qu'il faut revérifier ?")
+        v.addWidget(self._note, 1)
+        boutons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        boutons.accepted.connect(self.accept)
+        boutons.rejected.connect(self.reject)
+        v.addWidget(boutons)
+        self._note.setFocus()
+
+    def note(self):
+        return self._note.toPlainText().strip()
 
 
 class DialogueSymbole(QDialog):
@@ -201,6 +269,14 @@ class FenetrePrincipale(QMainWindow):
         self._tache: Tache | None = None
         self._symboles_broker: list[str] | None = None
         self._tentatives = set()       # trous déjà tentés : on ne re-propose pas le même
+        self._labos_en_cours: list[Tache] = []
+        self._labo_cle = None
+        self._labo_lignes = ([], [])       # (politiques, long/short) de la paire affichée
+        self._a_restaurer = None           # paire à resélectionner après une analyse
+        self._configs = {}                 # id -> configs.ConfigSauvee, onglet Configs
+        self._timer_labo = QTimer(self)
+        self._timer_labo.setSingleShot(True)
+        self._timer_labo.timeout.connect(self._lancer_labo)
 
         self._construire_panneau()
         self._construire_vues()
@@ -226,6 +302,15 @@ class FenetrePrincipale(QMainWindow):
         self.statusBar().addPermanentWidget(self.barre_progres)
 
         self._charger_symboles()
+
+    def closeEvent(self, event):
+        """Interrompt les calculs en cours et attend leurs threads avant de quitter."""
+        taches = list(self._labos_en_cours) + ([self._tache] if self._tache is not None else [])
+        for tache in taches:
+            tache.annuler()
+        for tache in taches:
+            tache.wait(10_000)
+        super().closeEvent(event)
 
     # ---------------------------------------------------------------- panneau
 
@@ -396,6 +481,34 @@ class FenetrePrincipale(QMainWindow):
         for widget, date in ((self.date_fin, fin), (self.date_debut, fin - np.timedelta64(120, "D"))):
             widget.setDate(QDate.fromString(str(date), "yyyy-MM-dd"))
 
+    def _lire_tendance(self):
+        return tend.Tendance(
+            mode=self.combo_tend_mode.currentData(), ma_type=self.combo_tend_ma.currentText(),
+            unite=self.combo_tend_unite.currentText(), periode=self.spin_tend_periode.value(),
+            rapide=self.spin_tend_rapide.value(), lente=self.spin_tend_lente.value())
+
+    def _ecrire_tendance(self, t):
+        for widget in (self.combo_tend_mode, self.combo_tend_ma, self.combo_tend_unite):
+            widget.blockSignals(True)
+        self.combo_tend_mode.setCurrentIndex(max(self.combo_tend_mode.findData(t.mode), 0))
+        self.combo_tend_ma.setCurrentText(t.ma_type)
+        self.combo_tend_unite.setCurrentText(t.unite)
+        for widget in (self.combo_tend_mode, self.combo_tend_ma, self.combo_tend_unite):
+            widget.blockSignals(False)
+        self.spin_tend_periode.setValue(t.periode)
+        self.spin_tend_rapide.setValue(t.rapide)
+        self.spin_tend_lente.setValue(t.lente)
+        self._maj_champs_tendance()
+
+    def _maj_champs_tendance(self):
+        mode = self.combo_tend_mode.currentData()
+        visibles = {"ma": mode != "aucune", "unite": mode != "aucune",
+                    "periode": mode == "niveau", "rapide": mode == "croisement",
+                    "lente": mode == "croisement"}
+        for nom, (etiquette, widget) in self._champs_tend.items():
+            etiquette.setVisible(visibles[nom])
+            widget.setVisible(visibles[nom])
+
     def _lire_reglages(self):
         return cli.Reglages(self.edit_ctid.text(), self.edit_pwd.text(), self.edit_account.text())
 
@@ -460,9 +573,21 @@ class FenetrePrincipale(QMainWindow):
                                    self.check_trailing.isChecked()),
             leviers=leviers, n_departs=self.spin_departs.value(),
             min_trades=self.spin_min_trades.value(), couts=couts, reglages=reglages,
-            telecharger=self.check_telecharger.isChecked())
+            telecharger=self.check_telecharger.isChecked(), tendance=self._lire_tendance())
 
     # ------------------------------------------------------------------ vues
+
+    @staticmethod
+    def _panneau_labo(table, note):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 4, 0, 0)
+        v.addWidget(table, 1)
+        etiquette = QLabel(note)
+        etiquette.setWordWrap(True)
+        etiquette.setStyleSheet("color: #666;")
+        v.addWidget(etiquette)
+        return w
 
     def _construire_vues(self):
         self.onglets = QTabWidget()
@@ -490,24 +615,90 @@ class FenetrePrincipale(QMainWindow):
         v = QVBoxLayout(w)
         h = QHBoxLayout()
         self.combo_crible_sym = QComboBox()
-        self.combo_metrique = QComboBox()
-        for cle, libelle in charts.METRIQUES.items():
-            self.combo_metrique.addItem(libelle, cle)
-        self.combo_crible_levier = QComboBox()
-        for widget in (self.combo_crible_sym, self.combo_metrique, self.combo_crible_levier):
-            widget.currentIndexChanged.connect(self._maj_crible)
+        self.combo_crible_sym.currentIndexChanged.connect(self._changer_symbole_crible)
         h.addWidget(QLabel("Symbole"))
         h.addWidget(self.combo_crible_sym)
-        h.addWidget(QLabel("Métrique"))
-        h.addWidget(self.combo_metrique)
-        h.addWidget(QLabel("Levier"))
-        h.addWidget(self.combo_crible_levier)
+        h.addSpacing(20)
+
+        # Filtre de tendance de fond : les longs ne partent qu'avec la tendance.
+        self.combo_tend_mode = QComboBox()
+        for cle, libelle in tend.MODES.items():
+            self.combo_tend_mode.addItem(libelle, cle)
+        self.combo_tend_ma = QComboBox()
+        self.combo_tend_ma.addItems(moyennes.TYPES)
+        self.combo_tend_unite = QComboBox()
+        self.combo_tend_unite.addItems(["m5", "m15", "h1", "h4"])
+        self.combo_tend_unite.setCurrentText("h1")
+        self.spin_tend_periode = _spin(2, 1000, 200)
+        self.spin_tend_rapide = _spin(2, 500, 20)
+        self.spin_tend_lente = _spin(3, 1000, 50)
+        self.bouton_tendance = QPushButton("Appliquer")
+        self.bouton_tendance.setToolTip("Recalcule le criblage de ce symbole avec ce filtre. "
+                                        "\"Analyser\" l'applique à tous les symboles.")
+        self.bouton_tendance.clicked.connect(self._appliquer_tendance)
+        self.combo_tend_mode.currentIndexChanged.connect(self._maj_champs_tendance)
+        h.addWidget(QLabel("Tendance"))
+        h.addWidget(self.combo_tend_mode)
+        self._champs_tend = {
+            "ma": (QLabel("Moyenne"), self.combo_tend_ma),
+            "unite": (QLabel("TF"), self.combo_tend_unite),
+            "periode": (QLabel("Période"), self.spin_tend_periode),
+            "rapide": (QLabel("Rapide"), self.spin_tend_rapide),
+            "lente": (QLabel("Lente"), self.spin_tend_lente),
+        }
+        for etiquette, widget in self._champs_tend.values():
+            h.addWidget(etiquette)
+            h.addWidget(widget)
+        h.addWidget(self.bouton_tendance)
         h.addStretch(1)
-        h.addWidget(QLabel("Clique sur une case pour ouvrir son détail"))
-        self.vue_crible = PlotlyView()
-        self.vue_crible.clic.connect(self._clic_crible)
+        self._maj_champs_tendance()
+
+        self.table_crible = _tableau([], etirer=False)
+        self.table_crible.setSortingEnabled(True)
+        self.table_crible.setAlternatingRowColors(True)
+        self.table_crible.itemSelectionChanged.connect(self._planifier_labo)
+        self.table_crible.itemDoubleClicked.connect(self._ouvrir_detail_depuis_crible)
+
+        self.label_labo = QLabel("Lance une analyse, puis sélectionne une ligne.")
+        self.label_labo.setStyleSheet("font-weight: bold;")
+        self.table_pol = _tableau([
+            "Politique de sortie", "Rend. %", "DD %", "Sharpe", "PF", "Réussite %", "Trades",
+            "Rend/DD", "Via stop", "Levier", "P(réussite)", "Témoin", "Gain (pts)"], etirer=False)
+        self.table_ls = _tableau([
+            "Variante", "Rend. %", "DD %", "Sharpe", "PF", "Longs", "Shorts", "Trades",
+            "Rend/DD", "Levier", "P(réussite)"], etirer=False)
+        self.onglets_labo = QTabWidget()
+        self.onglets_labo.addTab(self._panneau_labo(self.table_pol, (
+            "Mêmes entrées partout, seule la sortie change. Via stop = trades sortis par le stop "
+            "ou le trailing plutôt que par le croisement (0 = il ne s'est jamais déclenché, la "
+            "ligne est alors identique au croisement seul). Gain = P(réussite) moins celle d'un "
+            "témoin sans edge, de même volatilité et de même dérive que l'actif, au levier qui "
+            "maximise ce gain.")), "Croisement / stop / trailing")
+        self.onglets_labo.addTab(self._panneau_labo(self.table_ls, (
+            "Long seul, short seul, long + short (retournement). Les lignes « tendance » ne "
+            "prennent un long qu'avec la tendance de fond et un short qu'à contre (filtre à "
+            "configurer ci-dessus). Levier = celui qui maximise la P(réussite). Pas de témoin : "
+            "la dérive de l'actif joue contre un short.")), "Long / short")
+        self.bouton_sauver = QPushButton("Sauvegarder cette config...")
+        self.bouton_sauver.setToolTip(
+            "Enregistre dans la base DuckDB, avec une note : la paire sélectionnée, le filtre de "
+            "tendance, et la ligne sélectionnée dans chaque onglet de détail (par défaut : "
+            "croisement seul, long seul).")
+        self.bouton_sauver.clicked.connect(self._sauvegarder_config)
+        bas = QWidget()
+        vb = QVBoxLayout(bas)
+        vb.setContentsMargins(0, 0, 0, 0)
+        entete = QHBoxLayout()
+        entete.addWidget(self.label_labo, 1)
+        entete.addWidget(self.bouton_sauver)
+        vb.addLayout(entete)
+        vb.addWidget(self.onglets_labo, 1)
+        separateur = QSplitter(Qt.Orientation.Vertical)
+        separateur.addWidget(self.table_crible)
+        separateur.addWidget(bas)
+        separateur.setSizes([380, 320])
         v.addLayout(h)
-        v.addWidget(self.vue_crible, 1)
+        v.addWidget(separateur, 1)
         self.onglets.addTab(w, ONGLETS[T_CRIBLE])
 
         # Détail
@@ -593,6 +784,37 @@ class FenetrePrincipale(QMainWindow):
         v.addWidget(self.vue_cmp, 1)
         self.onglets.addTab(w, ONGLETS[T_COMPARAISON])
 
+        # Configs sauvegardées
+        w = QWidget()
+        v = QVBoxLayout(w)
+        h = QHBoxLayout()
+        for libelle, action in (("Modifier la note", self._modifier_note),
+                                ("Recharger les paramètres", self._recharger_config),
+                                ("Copier le résumé", self._copier_resume),
+                                ("Supprimer", self._supprimer_config)):
+            bouton = QPushButton(libelle)
+            bouton.clicked.connect(action)
+            h.addWidget(bouton)
+        h.addStretch(1)
+        h.addWidget(QLabel(f"Base : {configs.chemin_base()}"))
+        self.table_configs = _tableau([
+            "#", "Date", "Note", "Symbole", "Période", "Paire", "Tendance", "Sortie", "Direction",
+            "Rend. %", "P(réussite)", "Levier"], etirer=False)
+        self.table_configs.itemSelectionChanged.connect(self._afficher_resume_config)
+        self.table_configs.itemDoubleClicked.connect(lambda _: self._modifier_note())
+        self.texte_config = QPlainTextEdit()
+        self.texte_config.setReadOnly(True)
+        self.texte_config.setMaximumHeight(210)
+        self.texte_config.setPlaceholderText(
+            "Sauvegarde une config depuis l'onglet Criblage, puis retrouve-la ici. "
+            "Recharger remet ses paramètres dans le panneau de gauche : reste à cliquer sur Analyser.")
+        v.addLayout(h)
+        v.addWidget(self.table_configs, 1)
+        v.addWidget(self.texte_config)
+        self.onglets.addTab(w, ONGLETS[T_CONFIGS])
+        self.onglets.currentChanged.connect(
+            lambda i: self._rafraichir_configs() if i == T_CONFIGS else None)
+
     # -------------------------------------------------------------- analyse
 
     def _analyser(self):
@@ -644,6 +866,12 @@ class FenetrePrincipale(QMainWindow):
                             f"{trou.manquants} jours ouvrés sans données sur la période "
                             f"({trou.premier_manquant} -> {trou.dernier_manquant})."))
                     res.bougies = b
+                    try:
+                        res.haussiere = tend.calculer(b, params.tendance)
+                        res.tendance = params.tendance
+                    except Exception as e:
+                        res.alertes.append(data.Alerte(
+                            "avertissement", f"Filtre de tendance ignoré : {e}"))
                     prix = float(np.median(b.close))
                     spread, comm, contrat = params.couts[sym]
                     res.couts = engine.Couts(spread if spread is not None else prix * 2e-4,
@@ -655,7 +883,7 @@ class FenetrePrincipale(QMainWindow):
                         progres=lambda f, t, base=base, sym=sym: progres(
                             int(base + 100 - part_crible + f / t * part_crible), n * 100,
                             f"{sym} : criblage"),
-                        annule=annule)
+                        annule=annule, haussiere=res.haussiere)
                 except Exception as e:
                     res.erreur = f"{type(e).__name__} : {e}"
             return sortie
@@ -746,7 +974,7 @@ class FenetrePrincipale(QMainWindow):
             combo.clear()
             combo.addItems(analyses)
             combo.blockSignals(False)
-        for combo in (self.combo_crible_levier, self.combo_chal_levier, self.combo_cmp_levier):
+        for combo in (self.combo_chal_levier, self.combo_cmp_levier):
             combo.blockSignals(True)
             combo.clear()
             for lev in self.params.leviers:
@@ -756,14 +984,23 @@ class FenetrePrincipale(QMainWindow):
         self.spin_det_lente.setValue(self.params.lente)
         self.detail = None
         self.onglets.setCurrentIndex(T_APERCU)
+        restaurer, self._a_restaurer = self._a_restaurer, None
         if analyses:
-            # On ouvre le symbole le mieux classé de la vue d'ensemble.
-            sym = max(analyses, key=lambda s: (self.resultats[s].meilleure() or _AUCUNE).meilleur_levier()[1])
+            if restaurer is not None and restaurer[0] in analyses:
+                sym, e, s = restaurer          # la config qu'on vient de recharger
+            else:
+                # On ouvre le symbole le mieux classé de la vue d'ensemble.
+                sym = max(analyses, key=lambda x: (self.resultats[x].meilleure() or _AUCUNE).meilleur_levier()[1])
+                m = self.resultats[sym].meilleure()
+                e, s = (m.entree_type, m.sortie_type) if m is not None else (None, None)
+                restaurer = None
             self.combo_crible_sym.setCurrentText(sym)
-            self._maj_crible()
-            meilleure = self.resultats[sym].meilleure()
-            if meilleure is not None:
-                self._selectionner_config(sym, meilleure.entree_type, meilleure.sortie_type)
+            self._changer_symbole_crible()
+            if e is not None:
+                self._selectionner_paire_crible(e, s)
+                self._selectionner_config(sym, e, s)
+            if restaurer is not None:
+                self.onglets.setCurrentIndex(T_CRIBLE)
 
     def _remplir_apercu(self):
         t = self.table_apercu
@@ -827,22 +1064,374 @@ class FenetrePrincipale(QMainWindow):
 
     # -------------------------------------------------------------- criblage
 
+    def _changer_symbole_crible(self):
+        r = self.resultats.get(self.combo_crible_sym.currentText())
+        if r is not None:
+            self._ecrire_tendance(r.tendance)
+        self._maj_crible()
+
     def _maj_crible(self):
         sym = self.combo_crible_sym.currentText()
         r = self.resultats.get(sym)
+        t = self.table_crible
+        t.setSortingEnabled(False)
+        t.setRowCount(0)
         if r is None or not r.lignes:
             return
-        metrique = self.combo_metrique.currentData()
-        self.combo_crible_levier.setEnabled(metrique == "p_levier")
-        levier = self.combo_crible_levier.currentData() or 1.0
-        self.vue_crible.afficher(
-            charts.heatmap_crible(r.lignes, metrique, levier, self.params.regles))
+        leviers, hasard = self.params.leviers, self.params.regles.hasard_pur()
+        colonnes = (["Entrée", "Sortie", "Trades", "Rend. %", "DD %", "Sharpe", "PF", "Réussite %"]
+                    + [f"P x{lev:g}" for lev in leviers] + ["Meilleur P", "Levier", "Écart (pts)"])
+        t.setColumnCount(len(colonnes))
+        t.setHorizontalHeaderLabels(colonnes)
+        for l in r.lignes:
+            i = t.rowCount()
+            t.insertRow(i)
+            lev, p = l.meilleur_levier()
+            cellules = [
+                QTableWidgetItem(l.entree_type), QTableWidgetItem(l.sortie_type),
+                _Num(str(l.n_trades), l.n_trades),
+                _Num(f"{l.rendement_pct:+.1f}", l.rendement_pct, _signe(l.rendement_pct)),
+                _Num(f"{l.dd_pct:.1f}", l.dd_pct),
+                _Num(_n(l.sharpe, ".2f"), l.sharpe, _signe(l.sharpe)),
+                _Num(_n(l.profit_factor, ".2f"), l.profit_factor),
+                _Num(_n(l.win_rate_pct, ".0f"), l.win_rate_pct),
+            ]
+            for lv in leviers:
+                pl = l.p_reussite.get(lv)
+                cellules.append(_Num("-" if pl is None else f"{pl * 100:.0f}", pl,
+                                     fond=None if pl is None else _fond_p(pl)))
+            avec_p = bool(l.p_reussite)
+            cellules += [
+                _Num(f"{p * 100:.0f}" if avec_p else "-", p if avec_p else None,
+                     fond=_fond_p(p) if avec_p else None),
+                _Num(f"x{lev:g}" if avec_p else "-", lev if avec_p else None),
+                _Num(f"{round((p - hasard) * 100):+d}" if avec_p else "-",
+                     (p - hasard) * 100 if avec_p else None),
+            ]
+            for j, cellule in enumerate(cellules):
+                t.setItem(i, j, cellule)
+            t.item(i, 0).setData(Qt.ItemDataRole.UserRole, (l.entree_type, l.sortie_type))
+        t.setSortingEnabled(True)
+        t.sortByColumn(len(leviers) + 8, Qt.SortOrder.DescendingOrder)     # "Meilleur P"
+        t.selectRow(0)
 
-    def _clic_crible(self, point):
-        entree, sortie = point.get("y"), point.get("x")
-        if entree in moyennes.CATALOGUE and sortie in moyennes.CATALOGUE:
-            self._selectionner_config(self.combo_crible_sym.currentText(), entree, sortie)
+    def _paire_selectionnee(self):
+        lignes = self.table_crible.selectionModel().selectedRows()
+        if not lignes:
+            return None
+        e, s = self.table_crible.item(lignes[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        return self.combo_crible_sym.currentText(), e, s
+
+    def _ouvrir_detail_depuis_crible(self, _item):
+        paire = self._paire_selectionnee()
+        if paire is not None:
+            self._selectionner_config(*paire)
             self.onglets.setCurrentIndex(T_DETAIL)
+
+    def _appliquer_tendance(self):
+        if self._tache is not None and self._tache.isRunning():
+            self._tache.annuler()
+            return
+        sym = self.combo_crible_sym.currentText()
+        r, p = self.resultats.get(sym), self.params
+        if r is None or r.bougies is None:
+            return
+        t = self._lire_tendance()
+
+        def travail(progres, annule, journal):
+            haussiere = tend.calculer(r.bougies, t)
+            lignes = engine.cribler(
+                r.bougies, moyennes.TYPES, moyennes.TYPES, p.rapide, p.lente, r.couts, p.regles,
+                p.leviers, p.n_departs, p.min_trades, p.capital,
+                progres=lambda f, n: progres(f, n, f"{sym} : criblage"), annule=annule,
+                haussiere=haussiere)
+            return haussiere, lignes
+
+        def fini(resultat):
+            r.haussiere, r.lignes = resultat
+            r.tendance = t
+            self.detail = None
+            self._remplir_apercu()
+            self._maj_crible()
+
+        self._demarrer(travail, fini, self.bouton_tendance, "Annuler", "Appliquer")
+
+    def _selectionner_paire_crible(self, entree, sortie):
+        t = self.table_crible
+        for i in range(t.rowCount()):
+            if t.item(i, 0).data(Qt.ItemDataRole.UserRole) == (entree, sortie):
+                t.selectRow(i)
+                t.scrollToItem(t.item(i, 0))
+                return
+
+    # -- sauvegarde des configs (DuckDB)
+
+    @staticmethod
+    def _ligne_labo_selectionnee(table, lignes):
+        """La ligne sélectionnée du tableau de détail, sinon la première (la référence)."""
+        rangs = table.selectionModel().selectedRows()
+        if rangs and rangs[0].row() < len(lignes):
+            return lignes[rangs[0].row()]
+        return lignes[0] if lignes else None
+
+    def _config_courante(self):
+        paire = self._paire_selectionnee()
+        if paire is None or self.params is None:
+            return None
+        sym, e, s = paire
+        r, p = self.resultats[sym], self.params
+        ligne = next(l for l in r.lignes if (l.entree_type, l.sortie_type) == (e, s))
+        lev, meilleur_p = ligne.meilleur_levier()
+        pol = self._ligne_labo_selectionnee(self.table_pol, self._labo_lignes[0])
+        ls = self._ligne_labo_selectionnee(self.table_ls, self._labo_lignes[1])
+        metriques = {"crible": {
+            "n_trades": ligne.n_trades, "rendement_pct": ligne.rendement_pct,
+            "dd_pct": ligne.dd_pct, "sharpe": ligne.sharpe, "win_rate_pct": ligne.win_rate_pct,
+            "profit_factor": ligne.profit_factor, "p_reussite": ligne.p_reussite,
+            "meilleur_levier": lev, "meilleur_p": meilleur_p if ligne.p_reussite else None,
+            "hasard": p.regles.hasard_pur()}}
+        if pol is not None:
+            metriques["politique"] = asdict(pol)
+        if ls is not None:
+            metriques["direction"] = asdict(ls)
+        return configs.Config(
+            note="", symbole=sym, unite=p.unite, debut=p.debut, fin=p.fin, entree_type=e,
+            sortie_type=s, rapide=p.rapide, lente=p.lente, tendance=r.tendance,
+            politique=pol.nom if pol else "croisement seul",
+            direction=ls.nom if ls else "long seul",
+            parametres={"regles": asdict(p.regles), "capital": p.capital,
+                        "leviers": list(p.leviers), "n_departs": p.n_departs,
+                        "min_trades": p.min_trades, "couts": asdict(r.couts)},
+            metriques=metriques)
+
+    def _sauvegarder_config(self):
+        config = self._config_courante()
+        if config is None:
+            QMessageBox.information(self, "Configs", "Sélectionne d'abord une ligne du criblage.")
+            return
+        dialogue = DialogueNote("Sauvegarder cette config", configs.resume(config), parent=self)
+        if not dialogue.exec():
+            return
+        try:
+            id_config = configs.sauvegarder(replace(config, note=dialogue.note()))
+        except Exception as e:
+            QMessageBox.warning(self, "Configs", f"Sauvegarde impossible : {e}")
+            return
+        self.statusBar().showMessage(f"Config #{id_config} sauvegardée.", 6000)
+
+    def _rafraichir_configs(self):
+        t = self.table_configs
+        t.setRowCount(0)
+        try:
+            self._configs = {c.id: c for c in configs.lister()}
+        except Exception as e:
+            self._configs = {}
+            self.texte_config.setPlainText(f"Base illisible : {e}")
+            return
+        for c in self._configs.values():
+            cr = c.metriques.get("crible", {})
+            i = t.rowCount()
+            t.insertRow(i)
+            note = c.note.strip().splitlines()[0] if c.note.strip() else ""
+            cellules = [
+                _Num(str(c.id), c.id), QTableWidgetItem(f"{c.cree_le:%d/%m/%Y %H:%M}"),
+                QTableWidgetItem(note if len(note) <= 60 else note[:59] + "…"),
+                QTableWidgetItem(c.symbole),
+                QTableWidgetItem(f"{c.unite.upper()} {_jour(c.debut)} -> {_jour(c.fin)}"),
+                QTableWidgetItem(f"{c.entree_type} → {c.sortie_type} {c.rapide}/{c.lente}"),
+                QTableWidgetItem(c.tendance.libelle().removeprefix("tendance : ")),
+                QTableWidgetItem(c.politique), QTableWidgetItem(c.direction),
+                _Num(_n(cr.get("rendement_pct"), "+.1f"), cr.get("rendement_pct"),
+                     _signe(cr.get("rendement_pct"))),
+                _Num(f"{cr['meilleur_p'] * 100:.0f} %" if cr.get("meilleur_p") is not None else "-",
+                     cr.get("meilleur_p")),
+                _Num(f"x{cr['meilleur_levier']:g}" if cr.get("meilleur_p") is not None else "-",
+                     cr.get("meilleur_levier")),
+            ]
+            cellules[2].setToolTip(c.note)
+            for j, cellule in enumerate(cellules):
+                t.setItem(i, j, cellule)
+            t.item(i, 0).setData(Qt.ItemDataRole.UserRole, c.id)
+        if t.rowCount():
+            t.selectRow(0)
+        else:
+            self.texte_config.clear()
+
+    def _config_selectionnee(self):
+        rangs = self.table_configs.selectionModel().selectedRows()
+        if not rangs:
+            return None
+        return self._configs.get(self.table_configs.item(rangs[0].row(), 0).data(Qt.ItemDataRole.UserRole))
+
+    def _afficher_resume_config(self):
+        c = self._config_selectionnee()
+        if c is not None:
+            self.texte_config.setPlainText(configs.resume(c))
+
+    def _modifier_note(self):
+        c = self._config_selectionnee()
+        if c is None:
+            return
+        dialogue = DialogueNote(f"Note de la config #{c.id}", note=c.note, parent=self)
+        if dialogue.exec():
+            configs.modifier_note(c.id, dialogue.note())
+            self._rafraichir_configs()
+
+    def _copier_resume(self):
+        c = self._config_selectionnee()
+        if c is not None:
+            QApplication.clipboard().setText(configs.resume(c))
+            self.statusBar().showMessage("Résumé copié.", 4000)
+
+    def _supprimer_config(self):
+        c = self._config_selectionnee()
+        if c is None:
+            return
+        Bouton = QMessageBox.StandardButton
+        if QMessageBox.question(self, "Supprimer", f"Supprimer la config #{c.id} ({c.symbole}) ?",
+                                Bouton.Yes | Bouton.No, Bouton.No) == Bouton.Yes:
+            configs.supprimer(c.id)
+            self._rafraichir_configs()
+
+    def _recharger_config(self):
+        """Remet les paramètres de la config dans le panneau de gauche (sans lancer d'analyse)."""
+        c = self._config_selectionnee()
+        if c is None:
+            return
+        for i in range(self.liste_symboles.count()):
+            self.liste_symboles.item(i).setCheckState(Qt.CheckState.Unchecked)
+        self._ajouter_symbole(c.symbole, True)
+        self.combo_unite.setCurrentText(c.unite)
+        self.date_debut.setDate(QDate.fromString(str(c.debut), "yyyy-MM-dd"))
+        self.date_fin.setDate(QDate.fromString(str(c.fin), "yyyy-MM-dd"))
+        self.spin_rapide.setValue(c.rapide)
+        self.spin_lente.setValue(c.lente)
+        self._ecrire_tendance(c.tendance)
+        par = c.parametres
+        r = par.get("regles", {})
+        for spin, cle in ((self.spin_cible, "cible_pct"), (self.spin_dd, "dd_max_pct"),
+                          (self.spin_jour, "perte_jour_pct"), (self.spin_duree, "jours_max")):
+            if cle in r:
+                spin.setValue(r[cle])
+        self.check_trailing.setChecked(bool(r.get("dd_trailing", False)))
+        if "capital" in par:
+            self.spin_capital.setValue(par["capital"])
+        if par.get("leviers"):
+            self.edit_leviers.setText(", ".join(f"{x:g}" for x in par["leviers"]))
+        if "n_departs" in par:
+            self.spin_departs.setValue(par["n_departs"])
+        if "min_trades" in par:
+            self.spin_min_trades.setValue(par["min_trades"])
+        cts = par.get("couts")
+        for i in range(self.table_couts.rowCount()):
+            if cts and self.table_couts.verticalHeaderItem(i).text() == c.symbole:
+                self.table_couts.item(i, 0).setText(f"{cts['spread']:g}")
+                self.table_couts.item(i, 1).setText(f"{cts['commission_par_lot_par_cote']:g}")
+                self.table_couts.item(i, 2).setText(f"{cts['taille_contrat']:g}")
+        self._a_restaurer = (c.symbole, c.entree_type, c.sortie_type)
+        self.statusBar().showMessage(
+            "Paramètres rechargés : clique sur Analyser pour retrouver cette config.", 10000)
+
+    # -- détails de la paire sélectionnée : politiques de sortie et long/short
+
+    def _planifier_labo(self):
+        self._timer_labo.start(250)       # évite de recalculer à chaque flèche du clavier
+
+    def _lancer_labo(self):
+        paire = self._paire_selectionnee()
+        if paire is None or self.params is None:
+            return
+        sym, e, s = paire
+        r, p = self.resultats[sym], self.params
+        cle = (sym, e, s, id(r.lignes), r.tendance)
+        self._labo_cle = cle
+        for tache in self._labos_en_cours:
+            tache.annuler()
+        self._labo_lignes = ([], [])
+        self.table_pol.setRowCount(0)
+        self.table_ls.setRowCount(0)
+        self.label_labo.setText(f"{sym} · {e} → {s} · {p.rapide}/{p.lente} · "
+                                f"{r.tendance.libelle()}   (calcul en cours...)")
+        b, couts, haussiere = r.bougies, r.couts, r.haussiere
+
+        def travail(progres, annule, journal):
+            entrees, sorties = engine.signaux(b.close, e, s, p.rapide, p.lente)
+            filtrees = entrees & haussiere if haussiere is not None else entrees
+            pol = labo.comparer_sorties(b, filtrees, sorties, couts, p.regles, p.leviers,
+                                        p.n_departs, p.capital, annule)
+            ls = labo.comparer_long_short(b, entrees, sorties, couts, p.regles, p.leviers,
+                                          p.n_departs, p.capital, haussiere, annule)
+            return pol, ls
+
+        tache = Tache(travail, self)
+        self._labos_en_cours.append(tache)
+
+        def termine(resultat):
+            self._labos_en_cours.remove(tache)
+            if cle == self._labo_cle and not tache.annulee:
+                self._afficher_labo(cle, b, *resultat)
+
+        def echec(message):
+            self._labos_en_cours.remove(tache)
+            if cle == self._labo_cle:
+                self.label_labo.setText(f"Détails indisponibles : {message}")
+
+        tache.fini.connect(termine)
+        tache.echec.connect(echec)
+        tache.start()
+
+    def _afficher_labo(self, cle, b, pol, ls):
+        sym, e, s = cle[:3]
+        p = self.params
+        self._labo_lignes = (pol, ls)
+        self.label_labo.setText(f"{sym} · {e} → {s} · {p.rapide}/{p.lente} · {cle[4].libelle()}")
+        bh_rend, bh_dd = labo.buy_and_hold(b.close)
+
+        def remplir(table, lignes, colonnes_fn, col_rend_dd):
+            table.setRowCount(0)
+            for l in lignes:
+                i = table.rowCount()
+                table.insertRow(i)
+                for j, c in enumerate(colonnes_fn(l)):
+                    table.setItem(i, j, c)
+            # La référence : l'actif seul, sans stratégie.
+            bh = [""] * table.columnCount()
+            bh[:3] = ["Buy & hold", f"{bh_rend:+.1f}", f"{bh_dd:.1f}"]
+            bh[col_rend_dd] = f"{bh_rend / bh_dd:.2f}" if bh_dd else ""
+            i = table.rowCount()
+            table.insertRow(i)
+            for j, texte in enumerate(bh):
+                table.setItem(i, j, _cellule(texte, droite=j > 0))
+
+        def commun(l):
+            return [_Num(f"{l.rendement_pct:+.1f}", l.rendement_pct, _signe(l.rendement_pct)),
+                    _Num(f"{l.dd_pct:.1f}", l.dd_pct),
+                    _Num(_n(l.sharpe, ".2f"), l.sharpe, _signe(l.sharpe)),
+                    _Num(_n(l.profit_factor, ".2f"), l.profit_factor)]
+
+        def lev_p(l):
+            avec = l.p_reussite is not None
+            return [_Num(f"x{l.levier:g}" if avec else "-", l.levier),
+                    _Num(f"{l.p_reussite * 100:.0f} %" if avec else "-", l.p_reussite,
+                         fond=_fond_p(l.p_reussite) if avec else None)]
+
+        def ligne_pol(l):
+            gain = l.gain
+            return [QTableWidgetItem(l.nom), *commun(l),
+                    _Num(_n(l.win_rate_pct, ".0f"), l.win_rate_pct), _Num(str(l.n_trades), l.n_trades),
+                    _Num(_n(l.rend_dd, ".2f"), l.rend_dd),
+                    _Num(f"{l.via_stop}/{l.n_trades}", l.via_stop), *lev_p(l),
+                    _Num(f"{l.temoin * 100:.0f} %" if l.temoin is not None else "-", l.temoin),
+                    _Num(f"{round(gain * 100):+d}" if gain is not None else "-", gain,
+                         brush=QBrush(QColor("#009E73")) if gain is not None and gain > 0.05 else None)]
+
+        def ligne_ls(l):
+            return [QTableWidgetItem(l.nom), *commun(l), _Num(str(l.n_longs), l.n_longs),
+                    _Num(str(l.n_shorts), l.n_shorts), _Num(str(l.n_trades), l.n_trades),
+                    _Num(_n(l.rend_dd, ".2f"), l.rend_dd), *lev_p(l)]
+
+        remplir(self.table_pol, pol, ligne_pol, 7)
+        remplir(self.table_ls, ls, ligne_ls, 8)
 
     def _selectionner_config(self, sym, entree, sortie):
         self.combo_det_sym.setCurrentText(sym)
@@ -867,6 +1456,8 @@ class FenetrePrincipale(QMainWindow):
         entree_type, sortie_type = self.combo_det_entree.currentText(), self.combo_det_sortie.currentText()
         fees, slippage = r.couts.fractions(float(np.median(b.close)))
         entrees, sorties = engine.signaux(b.close, entree_type, sortie_type, rapide, lente)
+        if r.haussiere is not None:
+            entrees = entrees & r.haussiere
         stop, target = self.spin_stop.value() / 100 or None, self.spin_target.value() / 100 or None
         res = engine.backtest(b, entrees, sorties, fees, slippage, p.capital, stop, target)
 
@@ -880,7 +1471,8 @@ class FenetrePrincipale(QMainWindow):
         except ValueError as e:
             self.label_chal.setText(f"Simulation impossible : {e}")
             sims, temoins = [], []
-        self.detail = Detail(sym, b, res, entree_type, sortie_type, rapide, lente, sims, temoins)
+        self.detail = Detail(sym, b, res, entree_type, sortie_type, rapide, lente, sims, temoins,
+                             r.tendance)
 
         self._afficher_kpi(res)
         self._remplir_sorties(res)
@@ -962,6 +1554,7 @@ class FenetrePrincipale(QMainWindow):
         symboles = [s for s, r in self.resultats.items() if r.bougies is not None and r.lignes]
         couts = {s: self.resultats[s].couts for s in symboles}
         cfg = (d.entree_type, d.sortie_type, d.rapide, d.lente)
+        filtre = d.tendance
 
         def travail(progres, annule, journal):
             colonnes = [f"J-{(nombre - w) * longueur} → J-{(nombre - w - 1) * longueur}"
@@ -976,6 +1569,8 @@ class FenetrePrincipale(QMainWindow):
                 b = data.charger(sym, p.unite, p.fin - np.timedelta64(nombre * longueur, "D"), p.fin)
                 fees, slip = couts[sym].fractions(float(np.median(b.close)))
                 e, s = engine.signaux(b.close, *cfg[:2], *cfg[2:])
+                if filtre.active:
+                    e = e & tend.calculer(b, filtre)
                 res = engine.backtest(b, e, s, fees, slip, p.capital, avec_trades=False)
                 fin_t = b.temps[-1]
                 bornes = [fin_t - np.timedelta64((nombre - w) * longueur, "D") for w in range(nombre)]

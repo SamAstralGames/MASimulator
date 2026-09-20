@@ -61,6 +61,7 @@ class Trade:
     rendement_pct: float
     frais: float
     raison_sortie: str
+    direction: int = 1
 
 
 @dataclass(frozen=True)
@@ -97,16 +98,38 @@ def signaux(close, entree_type, sortie_type, rapide, lente, cache=None):
     return entrees, sorties
 
 
-def backtest(b: Bougies, entrees, sorties, fees, slippage, capital=10_000.0,
-             stop_pct=None, target_pct=None, avec_trades=True):
-    config = raptorbt.BacktestConfig(
+def nouvelle_config(fees, slippage, capital=10_000.0):
+    return raptorbt.BacktestConfig(
         initial_capital=capital, fees=fees, slippage=slippage,
         fill_timing="next_bar_open",
     )
-    if stop_pct is not None:
-        config.set_fixed_stop(stop_pct)
-    if target_pct is not None:
-        config.set_fixed_target(target_pct)
+
+
+def resultat_de(res, avec_trades=True):
+    """Convertit un résultat brut RaptorBT (array ou stratégie) en `Resultat`."""
+    m = res.metrics
+    metriques = {k: getattr(m, k, None) for k in _METRIQUES}
+    trades = []
+    if avec_trades:
+        trades = [
+            Trade(t.entry_idx, t.exit_idx, t.entry_price, t.exit_price, t.size,
+                  t.pnl, t.return_pct, t.fees, str(t.exit_reason), getattr(t, "direction", 1))
+            for t in res.trades()
+        ]
+    exposition = m.exposure_pct / 100 if m.exposure_pct is not None else None
+    return Resultat(metriques, np.asarray(res.equity_curve(), float), trades, exposition)
+
+
+def backtest(b: Bougies, entrees, sorties, fees, slippage, capital=10_000.0,
+             stop_pct=None, target_pct=None, avec_trades=True, config=None):
+    """Backtest long seul. `config` (optionnel) remplace stop_pct/target_pct :
+    c'est par là que passent les politiques de sortie de `labo`."""
+    if config is None:
+        config = nouvelle_config(fees, slippage, capital)
+        if stop_pct is not None:
+            config.set_fixed_stop(stop_pct)
+        if target_pct is not None:
+            config.set_fixed_target(target_pct)
 
     res = raptorbt.run_single_backtest(
         timestamps=b.timestamps_ns(),
@@ -114,17 +137,7 @@ def backtest(b: Bougies, entrees, sorties, fees, slippage, capital=10_000.0,
         entries=entrees, exits=sorties, direction=1, weight=1.0,
         symbol=b.symbole, config=config,
     )
-    m = res.metrics
-    metriques = {k: getattr(m, k, None) for k in _METRIQUES}
-    trades = []
-    if avec_trades:
-        trades = [
-            Trade(t.entry_idx, t.exit_idx, t.entry_price, t.exit_price, t.size,
-                  t.pnl, t.return_pct, t.fees, str(t.exit_reason))
-            for t in res.trades()
-        ]
-    exposition = m.exposure_pct / 100 if m.exposure_pct is not None else None
-    return Resultat(metriques, np.asarray(res.equity_curve(), float), trades, exposition)
+    return resultat_de(res, avec_trades)
 
 
 @dataclass(frozen=True)
@@ -150,8 +163,11 @@ class LigneCrible:
 
 def cribler(b: Bougies, entree_types, sortie_types, rapide, lente, couts: Couts,
             regles: propfirm.Regles, leviers=LEVIERS_DEFAUT, n_departs=300,
-            min_trades=20, capital=10_000.0, progres=None, annule=None):
+            min_trades=20, capital=10_000.0, progres=None, annule=None, haussiere=None):
     """Teste toutes les paires entrée x sortie et renvoie une LigneCrible par paire.
+
+    `haussiere` (tableau booléen, True = tendance de fond haussière) restreint les
+    entrées aux barres où elle est vraie.
 
     `progres(fait, total)` est appelé après chaque paire ; `annule()` renvoie
     True pour interrompre. Une paire sous `min_trades` garde ses métriques mais
@@ -167,6 +183,8 @@ def cribler(b: Bougies, entree_types, sortie_types, rapide, lente, couts: Couts,
         if annule is not None and annule():
             break
         entrees, sorties = signaux(b.close, e, s, rapide, lente, cache)
+        if haussiere is not None:
+            entrees = entrees & haussiere
         r = backtest(b, entrees, sorties, fees, slippage, capital, avec_trades=False)
         m = r.metriques
         n_trades = int(m["total_trades"] or 0)

@@ -37,7 +37,13 @@ Le principe reste celui des deux scripts de [RaptorBT](../RaptorBT/) : moteur de
 ## Vues
 
 - **Vue d'ensemble** : un indice par ligne, avec la meilleure config sur la fenêtre courante, sa P(réussite), l'écart au hasard et la fraîcheur des données.
-- **Criblage** : matrice entrée × sortie (EMA, WMA, ZLEMA, HMA, KAMA, SSMOOTH, VIDYA) en heatmap, avec les périodes en paramètres et une métrique au choix (P(réussite), rendement, drawdown, Sharpe, nombre de trades). Un clic sur une case ouvre le détail.
+- **Criblage** : un **tableau chiffré** des 49 paires entrée × sortie (EMA, WMA, ZLEMA, HMA, KAMA, SSMOOTH, VIDYA), triable sur chaque colonne : trades, rendement, drawdown, Sharpe, profit factor, taux de gain, P(réussite) à chaque levier, meilleur levier et écart au hasard. La ligne sélectionnée ouvre en dessous ses **détails**, comme dans les scripts d'origine (`exit_policy`, `labo_propfirm`, `long_short`) :
+  - **Croisement / stop / trailing** : les mêmes entrées avec la sortie sur croisement seul, des stops ATR (avec ou sans target 1:2) et des trailings de 0,10 % à 2,5 %. Pour chaque politique : rendement, drawdown, Sharpe, profit factor, nombre de sorties réellement faites par le stop (un trailing à 0 n'a jamais coupé avant le croisement), P(réussite), témoin sans edge et **gain** (écart en points), au levier qui maximise ce gain. Ligne buy & hold en référence.
+  - **Long / short** : long seul, short seul et long + short (retournement), avec et sans filtre de tendance, et P(réussite) pour chacun.
+  - **Filtre de tendance de fond**, configurable au-dessus du tableau : aucun, prix au-dessus d'une moyenne (ex. EMA 200), ou croisement de deux moyennes (ex. EMA 20/50). Le type de moyenne, le timeframe (M5 à H4, reconstruit depuis les M1) et les périodes se règlent. Il restreint les longs du criblage aux barres où la tendance est haussière, et sert de garde-fou direction par direction dans l'onglet long / short. Le bouton **Appliquer** recalcule le symbole affiché ; **Analyser** l'applique à tous.
+
+  Double-clic sur une ligne : ouvre son graphique dans l'onglet Détail.
+- **Configs** : les configs sauvegardées depuis le Criblage (bouton « Sauvegarder cette config... »), chacune avec sa **note**. Une config garde le symbole et la fenêtre, la paire de moyennes et ses périodes, le filtre de tendance, la politique de sortie et la variante long/short sélectionnées dans les détails, les règles du challenge et les coûts, plus un instantané des métriques au moment de la sauvegarde. On peut modifier la note (double-clic), copier un résumé lisible, **recharger les paramètres** dans le panneau de gauche pour ré-analyser sur une autre fenêtre, ou supprimer. La base est un fichier DuckDB, `~/.local/share/masimulator/configs.duckdb` (variable `MASIM_DB` pour en changer), interrogeable à la main.
 - **Détail d'une config** : courbe d'equity, trades sur le graphique de prix, drawdown, raisons de sortie, statistiques de trades.
 - **Challenge prop firm** : distribution des issues (réussi / DD / perte jour / temps écoulé) selon la date de départ, avec le levier en paramètre. Règles éditables (cible, DD max, perte jour, durée, DD trailing ou fixe).
 - **Comparaison de fenêtres et d'indices** : la même config évaluée sur plusieurs sous-fenêtres et sur d'autres indices, pour que l'utilisateur voie lui-même si elle tient ou si elle ne vaut que sur la fenêtre courante.
@@ -81,7 +87,10 @@ src/masimulator/
 ├── data.py            lecture du cache cTrader, contrôle sanitaire
 ├── cli.py             pilote ctrader-cli : compilation du bot, téléchargement, symboles du broker
 ├── moyennes.py        catalogue de moyennes, signaux de croisement
+├── tendance.py        filtre de tendance de fond, sur le timeframe tradé ou un supérieur
 ├── engine.py          backtest RaptorBT, coûts broker, criblage entrée x sortie
+├── labo.py            détails d'une paire : politiques de sortie, long/short, gain vs témoin
+├── configs.py         configs sauvegardées dans DuckDB, avec note
 ├── propfirm.py        règles et simulateur de challenge
 └── ui/
     ├── window.py      fenêtre principale, paramètres et vues
@@ -92,12 +101,14 @@ DataFetcher/           bot cTrader fictif (C#), lancé en backtest pour téléch
 
 Le calcul est **porté depuis [RaptorBT](../RaptorBT/)** ([moyennes.py](../RaptorBT/moyennes.py), [simulateur_propfirm.py](../RaptorBT/simulateur_propfirm.py), [couts.py](../RaptorBT/couts.py), [donnees.py](../RaptorBT/donnees.py)), débarrassé des `print` : les fonctions renvoient des structures que l'interface affiche. Le port a été vérifié sur XAUUSD : VIDYA → KAMA 9/21 donne 196 trades et 85 % de réussite à levier x5, comme dans le rapport de BotX.
 
+RaptorBT est épinglé en `0.13.1`, qui n'a pas `batch_single_backtest` (présent en 0.13.4) : les politiques de sortie sont donc lancées une par une, ce qui reste très rapide.
+
 ## État actuel
 
 Les cinq vues fonctionnent. Ce qui n'est pas encore là :
 
-- **Long seul.** Pas de short ni de retournement (le moteur `Strategy` de RaptorBT est plus lent).
-- **Filtre de tendance HTF** de [tendance_htf.py](../RaptorBT/tendance_htf.py) : non porté.
+- **Le criblage est long seul.** Le short n'apparaît que dans les détails (onglet long / short), calculé à la demande.
+- **Filtre de tendance et historique.** Une moyenne H1 de période 200 a besoin d'environ 25 jours d'historique avant la date de début : s'il manque dans le cache, les premières barres n'ont pas de tendance et ne prennent pas de position.
 - **Comparaison de fenêtres.** Elle remonte dans le temps depuis la date de fin, mais ne télécharge pas l'historique qui manquerait avant la date de début : les fenêtres sans données s'affichent vides.
 - **Courbes décimées.** Prix, moyennes et equity sont réduits à ~5 000 points (min/max par tranche, les pics sont conservés). Zoomer n'ajoute pas de détail.
 - **Coûts par défaut** approximatifs (XAUUSD, EURUSD connus, 2 bps du prix sinon) : à remplacer par les tarifs du compte.

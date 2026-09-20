@@ -22,7 +22,7 @@ import numpy as np
 RACINE_DEFAUT = "~/.config/Spotware/Cache/Spotware/BacktestingCache"
 
 # unité -> minutes par barre
-MINUTES = {"m1": 1, "m5": 5, "m15": 15, "h1": 60}
+MINUTES = {"m1": 1, "m5": 5, "m15": 15, "h1": 60, "h4": 240}
 
 _STRUCTURE = np.dtype([
     ("timestamp", "<i8"), ("open", "<i8"), ("high", "<i8"),
