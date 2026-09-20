@@ -50,7 +50,7 @@ Le principe reste celui des deux scripts de [RaptorBT](../RaptorBT/) : moteur de
 
 ## Données
 
-Bougies lues depuis le **cache local de cTrader** (`~/.config/Spotware/Cache/Spotware/BacktestingCache`, fichiers `.zbars` M1 reconstruits en M5/M15/H1). La variable d'environnement `MASIM_CTRADER` change de racine. Le contrôle sanitaire (`data.controle` : bougies incohérentes, sauts suspects, fenêtre trop courte) remonte ses alertes dans la vue d'ensemble, parce qu'un prix aberrant suffit à fabriquer un faux trade gagnant.
+Bougies lues depuis le **cache local de cTrader** (`~/.config/Spotware/Cache/Spotware/BacktestingCache`, fichiers `.zbars` M1, reconstruits en M5, M15, H1 ou H4). La variable d'environnement `MASIM_CTRADER` change de racine. Le contrôle sanitaire (`data.controle` : bougies incohérentes, sauts suspects, fenêtre trop courte) remonte ses alertes dans la vue d'ensemble, parce qu'un prix aberrant suffit à fabriquer un faux trade gagnant.
 
 L'utilisateur choisit **la date de début et la date de fin**. L'app affiche la date de la dernière bougie par symbole, en rouge quand elle date de plus d'une semaine.
 
