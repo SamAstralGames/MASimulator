@@ -209,3 +209,52 @@ def figure_suivi(suivis, libelles, selection, regles: Regles):
     fig.update_yaxes(title="P(réussite) %", range=[0, 100], row=3, col=1)
     fig.update_layout(hovermode="closest", legend=dict(orientation="h", y=1.08, x=0))
     return _base(fig).update_layout(margin=dict(l=60, r=24, t=36, b=36))
+
+
+def figure_horaire(tranches, pas_min):
+    """Contribution au rendement, trades entrés et PnL moyen, par tranche de la journée.
+
+    Trois panneaux sur le même axe des heures (jamais deux échelles sur un axe). Les barres
+    vertes gagnent, les orange perdent : la couleur redit le signe, qui se lit déjà sur l'axe.
+    """
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07,
+                        row_heights=[0.4, 0.25, 0.35])
+    if not tranches:
+        fig.add_annotation(text="Aucune donnée", showarrow=False, font=dict(size=14, color=GRIS),
+                           xref="paper", yref="paper", x=0.5, y=0.5)
+        return _base(fig)
+    x = [t.debut_min / 60 for t in tranches]
+    largeur = pas_min / 60 * 0.9
+    plages = [t.libelle_plage for t in tranches]
+    signe = lambda ys: [COULEURS_ISSUE["REUSSI"] if (y or 0) >= 0 else COULEURS_ISSUE["ECHEC_DD"]
+                        for y in ys]
+
+    contribution = [t.contribution_pct for t in tranches]
+    fig.add_trace(go.Bar(
+        x=x, y=contribution, width=largeur, offset=0, marker_color=signe(contribution),
+        customdata=list(zip(plages, [t.n_barres for t in tranches])),
+        hovertemplate="%{customdata[0]}<br>contribution %{y:+.2f} % (%{customdata[1]} barres)"
+                      "<extra></extra>"), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=x, y=[t.n_trades for t in tranches], width=largeur, offset=0, marker_color=BLEU,
+        customdata=list(zip(plages, [_pct_txt(t.taux_gain_pct) for t in tranches])),
+        hovertemplate="%{customdata[0]}<br>%{y} trades entrés, gagnants %{customdata[1]}"
+                      "<extra></extra>"), row=2, col=1)
+    moyen = [t.pnl_moyen for t in tranches]
+    fig.add_trace(go.Bar(
+        x=x, y=[m if m is not None else 0 for m in moyen], width=largeur, offset=0,
+        marker_color=signe(moyen), customdata=list(zip(plages, [t.n_trades for t in tranches])),
+        hovertemplate="%{customdata[0]}<br>PnL moyen %{y:+,.2f} (%{customdata[1]} trades)"
+                      "<extra></extra>"), row=3, col=1)
+
+    fig.update_xaxes(range=[0, 24], tickmode="array", tickvals=list(range(0, 25, 2)),
+                     ticktext=[f"{h:02d}h" for h in range(0, 25, 2)], row=3, col=1)
+    fig.update_yaxes(title="Contribution %", row=1, col=1)
+    fig.update_yaxes(title="Trades entrés", row=2, col=1)
+    fig.update_yaxes(title="PnL moyen", row=3, col=1)
+    fig.update_layout(showlegend=False, bargap=0)
+    return _base(fig).update_layout(margin=dict(l=60, r=24, t=24, b=36))
+
+
+def _pct_txt(v):
+    return "n/a" if v is None else f"{v:.0f} %"

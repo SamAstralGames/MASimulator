@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from .. import cli, configs, data, engine, labo, moyennes, propfirm, suivi
+from .. import cli, configs, data, engine, horaire, labo, moyennes, propfirm, suivi
 from .. import tendance as tend
 from . import charts
 from .webview import PlotlyView
@@ -867,8 +867,15 @@ class FenetrePrincipale(QMainWindow):
         self.table_sorties.setMaximumHeight(120)
         v.addLayout(h)
         v.addWidget(self.label_kpi)
-        v.addWidget(self.vue_detail, 1)
-        v.addWidget(self.table_sorties)
+        self.onglets_detail = QTabWidget()
+        prix = QWidget()
+        vp = QVBoxLayout(prix)
+        vp.setContentsMargins(0, 4, 0, 0)
+        vp.addWidget(self.vue_detail, 1)
+        vp.addWidget(self.table_sorties)
+        self.onglets_detail.addTab(prix, "Prix, equity, drawdown")
+        self.onglets_detail.addTab(self._construire_horaire(), "Par tranche horaire")
+        v.addWidget(self.onglets_detail, 1)
         self.onglets.addTab(w, ONGLETS[T_DETAIL])
 
         # Challenge
@@ -1891,8 +1898,86 @@ class FenetrePrincipale(QMainWindow):
 
         self._afficher_kpi(res)
         self._remplir_sorties(res)
+        self._maj_horaire()
         self.vue_detail.afficher(charts.figure_detail(b, res, entree_type, sortie_type, rapide, lente))
         self._maj_challenge()
+
+    # ------------------------------------------------ analyse par tranche horaire
+
+    def _construire_horaire(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 4, 0, 0)
+        h = QHBoxLayout()
+        self.combo_tranche = QComboBox()
+        for minutes, libelle in ((30, "30 min"), (60, "1 h"), (120, "2 h")):
+            self.combo_tranche.addItem(libelle, minutes)
+        self.spin_decalage = _spin(-12, 14, 0)
+        self.spin_decalage.setPrefix("UTC ")
+        self.spin_decalage.setSuffix(" h")
+        self.spin_decalage.setSpecialValueText("UTC")
+        self.spin_decalage.setToolTip(
+            "Les bougies sont en UTC. +1 ou +2 pour l'heure de Paris (l'heure d'été n'est pas "
+            "gérée : le décalage est le même toute l'année).")
+        for widget in (self.combo_tranche, self.spin_decalage):
+            (widget.currentIndexChanged if widget is self.combo_tranche
+             else widget.valueChanged).connect(lambda _: self._maj_horaire())
+        h.addWidget(QLabel("Tranche"))
+        h.addWidget(self.combo_tranche)
+        h.addWidget(QLabel("Heure affichée"))
+        h.addWidget(self.spin_decalage)
+        h.addStretch(1)
+        self.label_horaire = QLabel("Calcule d'abord une config.")
+        self.label_horaire.setWordWrap(True)
+        self.label_horaire.setToolTip(
+            "Contribution : le rendement de chaque barre (equity, position ouverte comprise) "
+            "additionné par tranche : où l'equity monte et où elle se dégrade. Trades : classés "
+            "par tranche d'ENTRÉE : à quelle heure la décision d'entrer est bonne ou mauvaise.")
+        self.vue_horaire = PlotlyView()
+        self.table_horaire = _tableau(["Tranche", "Barres", "Contribution %", "Trades entrés",
+                                       "Gagnants %", "PnL total", "PnL moyen"])
+        self.table_horaire.setSortingEnabled(True)
+        self.table_horaire.setAlternatingRowColors(True)
+        separateur = QSplitter(Qt.Orientation.Vertical)
+        separateur.addWidget(self.vue_horaire)
+        separateur.addWidget(self.table_horaire)
+        separateur.setSizes([420, 200])
+        v.addLayout(h)
+        v.addWidget(self.label_horaire)
+        v.addWidget(separateur, 1)
+        return w
+
+    def _maj_horaire(self):
+        d = self.detail
+        if d is None:
+            return
+        minutes = self.combo_tranche.currentData()
+        pas = horaire.pas_effectif(d.bougies.unite, minutes)
+        tranches = horaire.par_tranche(d.bougies, d.resultat, minutes, self.spin_decalage.value())
+        note = f"  (barres {d.bougies.unite.upper()} : tranche portée à {pas} min)" if pas != minutes else ""
+        self.label_horaire.setText(horaire.resume(tranches) + note)
+        self.vue_horaire.afficher(charts.figure_horaire(tranches, pas))
+
+        t = self.table_horaire
+        t.setSortingEnabled(False)
+        t.setRowCount(0)
+        for tr in tranches:
+            i = t.rowCount()
+            t.insertRow(i)
+            taux, moyen = tr.taux_gain_pct, tr.pnl_moyen
+            cellules = [
+                _Num(tr.libelle_plage, tr.debut_min),
+                _Num(str(tr.n_barres), tr.n_barres),
+                _Num(f"{tr.contribution_pct:+.2f}", tr.contribution_pct, brush=_signe(tr.contribution_pct)),
+                _Num(str(tr.n_trades), tr.n_trades),
+                _Num("n/a" if taux is None else f"{taux:.0f}", taux),
+                _Num(f"{tr.pnl_total:+,.2f}", tr.pnl_total, brush=_signe(tr.pnl_total)),
+                _Num("n/a" if moyen is None else f"{moyen:+,.2f}", moyen, brush=_signe(moyen)),
+            ]
+            for j, cellule in enumerate(cellules):
+                t.setItem(i, j, cellule)
+        t.setSortingEnabled(True)
+        t.sortItems(0, Qt.SortOrder.AscendingOrder)
 
     def _afficher_kpi(self, res):
         m = res.metriques
