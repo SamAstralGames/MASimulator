@@ -48,6 +48,17 @@ CREATE TABLE IF NOT EXISTS configs (
     parametres VARCHAR,
     metriques VARCHAR
 );
+CREATE SEQUENCE IF NOT EXISTS seq_groupes START 1;
+CREATE TABLE IF NOT EXISTS groupes (
+    id BIGINT PRIMARY KEY DEFAULT nextval('seq_groupes'),
+    nom VARCHAR NOT NULL UNIQUE,
+    cree_le TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS groupe_configs (
+    groupe_id BIGINT NOT NULL,
+    config_id BIGINT NOT NULL,
+    PRIMARY KEY (groupe_id, config_id)
+);
 """
 
 
@@ -162,7 +173,98 @@ def modifier_note(id_config, note, chemin=None):
 def supprimer(id_config, chemin=None):
     con = _connexion(chemin)
     try:
+        con.execute("DELETE FROM groupe_configs WHERE config_id = ?", [id_config])
         con.execute("DELETE FROM configs WHERE id = ?", [id_config])
+    finally:
+        con.close()
+
+
+# ------------------------------------------------------------------ groupes
+# Un groupe est un nom et un ensemble de configs : de quoi retrouver d'un clic le portefeuille
+# qu'on a composé. Une config peut appartenir à plusieurs groupes.
+
+@dataclass(frozen=True)
+class Groupe:
+    id: int
+    nom: str
+    ids: tuple          # ids des configs membres
+
+
+def lister_groupes(chemin=None):
+    """Tous les groupes, par nom. Les configs supprimées n'y figurent plus."""
+    con = _connexion(chemin)
+    try:
+        noms = con.execute("SELECT id, nom FROM groupes ORDER BY lower(nom), id").fetchall()
+        membres = con.execute(
+            """SELECT g.groupe_id, g.config_id FROM groupe_configs g
+               JOIN configs c ON c.id = g.config_id ORDER BY g.config_id""").fetchall()
+    finally:
+        con.close()
+    par_groupe = {}
+    for groupe_id, config_id in membres:
+        par_groupe.setdefault(groupe_id, []).append(config_id)
+    return [Groupe(i, nom, tuple(par_groupe.get(i, ()))) for i, nom in noms]
+
+
+def creer_groupe(nom, ids, chemin=None):
+    """Crée un groupe avec ces configs et renvoie son id. ValueError si le nom est vide ou pris."""
+    nom = nom.strip()
+    if not nom:
+        raise ValueError("Le nom du groupe est vide.")
+    con = _connexion(chemin)
+    try:
+        if con.execute("SELECT 1 FROM groupes WHERE lower(nom) = lower(?)", [nom]).fetchone():
+            raise ValueError(f"Un groupe « {nom} » existe déjà.")
+        id_groupe = con.execute(
+            "INSERT INTO groupes (nom, cree_le) VALUES (?, ?) RETURNING id",
+            [nom, datetime.now().replace(microsecond=0)]).fetchone()[0]
+        for id_config in dict.fromkeys(ids):
+            con.execute("INSERT INTO groupe_configs VALUES (?, ?)", [id_groupe, id_config])
+        return id_groupe
+    finally:
+        con.close()
+
+
+def ajouter_au_groupe(id_groupe, ids, chemin=None):
+    con = _connexion(chemin)
+    try:
+        for id_config in dict.fromkeys(ids):
+            con.execute("INSERT INTO groupe_configs VALUES (?, ?) ON CONFLICT DO NOTHING",
+                        [id_groupe, id_config])
+    finally:
+        con.close()
+
+
+def retirer_du_groupe(id_groupe, ids, chemin=None):
+    con = _connexion(chemin)
+    try:
+        for id_config in dict.fromkeys(ids):
+            con.execute("DELETE FROM groupe_configs WHERE groupe_id = ? AND config_id = ?",
+                        [id_groupe, id_config])
+    finally:
+        con.close()
+
+
+def renommer_groupe(id_groupe, nom, chemin=None):
+    nom = nom.strip()
+    if not nom:
+        raise ValueError("Le nom du groupe est vide.")
+    con = _connexion(chemin)
+    try:
+        if con.execute("SELECT 1 FROM groupes WHERE lower(nom) = lower(?) AND id <> ?",
+                       [nom, id_groupe]).fetchone():
+            raise ValueError(f"Un groupe « {nom} » existe déjà.")
+        con.execute("UPDATE groupes SET nom = ? WHERE id = ?", [nom, id_groupe])
+    finally:
+        con.close()
+
+
+def supprimer_groupe(id_groupe, chemin=None):
+    """Supprime le groupe, pas ses configs."""
+    con = _connexion(chemin)
+    try:
+        con.execute("DELETE FROM groupe_configs WHERE groupe_id = ?", [id_groupe])
+        con.execute("DELETE FROM groupes WHERE id = ?", [id_groupe])
     finally:
         con.close()
 

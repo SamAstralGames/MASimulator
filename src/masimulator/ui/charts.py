@@ -153,13 +153,16 @@ def heatmap_fenetres(z, colonnes, lignes, hover, titre, regles=None):
     return _base(fig, titre)
 
 
-def figure_suivi(suivis, libelles, selection, regles: Regles):
+def figure_suivi(suivis, libelles, selection, regles: Regles, agregat=None):
     """Le dernier mois de plusieurs configs : rendement, drawdown et P(réussite) glissante.
 
     Trois panneaux sur le même axe temps (jamais deux échelles sur un même axe). Une seule
     config est en couleur, celle qu'on regarde ; les autres restent en gris, lisibles au
     survol : avec vingt courbes, vingt couleurs ne diraient plus rien. Chaque trace porte l'id
     de sa config dans `meta`, pour qu'un clic sur la courbe la sélectionne dans le tableau.
+
+    Avec `agregat` (suivi.Agregat), `suivis` sont les configs agrégées : elles passent toutes en
+    gris, et le portefeuille est tracé par-dessus en couleur, sur les deux premiers panneaux.
     """
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                         row_heights=[0.4, 0.3, 0.3])
@@ -172,7 +175,7 @@ def figure_suivi(suivis, libelles, selection, regles: Regles):
 
     # la sélection en dernier : elle se dessine par-dessus
     for s in sorted(suivis, key=lambda s: s.id == selection):
-        choisie = s.id == selection
+        choisie = s.id == selection and agregat is None
         ligne = dict(color=BLEU if choisie else "#B5B5B5", width=2.5 if choisie else 1)
         nom = libelles.get(s.id, f"#{s.id}")
         groupe = str(s.id)
@@ -194,6 +197,18 @@ def figure_suivi(suivis, libelles, selection, regles: Regles):
             legendgroup=groupe, showlegend=False, connectgaps=False,
             hovertemplate=entete + f"P(réussite) %{{y:.0f}} % (fenêtre {s.fenetre_jours} j)"
                                    "<extra></extra>"), row=3, col=1)
+
+    if agregat is not None:
+        ligne = dict(color=BLEU, width=3)
+        nom = f"Portefeuille de {len(agregat.ids)} configs"
+        entete = "<b>%{fullData.name}</b><br>%{x|%d %b %H:%M}<br>"
+        for rang, y, survol in ((1, agregat.rendement, "rendement %{y:+.1f} %"),
+                                (2, agregat.drawdown, "drawdown %{y:.1f} %")):
+            i = _decimer(y, 600)
+            fig.add_trace(go.Scatter(
+                x=agregat.temps[i], y=y[i], mode="lines", name=nom, line=ligne, legendgroup="agregat",
+                showlegend=rang == 1, hovertemplate=entete + survol + "<extra></extra>"),
+                row=rang, col=1)
 
     ref = dict(width=1, dash="dash")
     fig.add_hline(y=regles.cible_pct, line=dict(color=COULEURS_ISSUE["REUSSI"], **ref), row=1, col=1,

@@ -7,14 +7,14 @@ from dataclasses import asdict, dataclass, field, replace
 import os
 
 import numpy as np
-from PySide6.QtCore import QDate, QSettings, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDate, QItemSelectionModel, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QTableWidget,
-    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import cli, configs, data, engine, horaire, labo, moyennes, propfirm, suivi
@@ -284,9 +284,10 @@ class FenetrePrincipale(QMainWindow):
         self._labo_lignes = ([], [])       # (politiques, long/short) de la paire affichée
         self._a_restaurer = None           # paire à resélectionner après une analyse
         self._configs = {}                 # id -> configs.ConfigSauvee, onglet Configs
+        self._groupes = {}                 # id -> configs.Groupe
         self._suivis = {}                  # id -> suivi.Suivi ou message d'erreur, vue d'ensemble
         self._tache_suivi: TacheSuivi | None = None
-        self._suivi_choisi = None          # config en couleur sur le graphique du suivi
+        self._suivi_ids = []               # configs sélectionnées dans le suivi (une : en couleur ; plusieurs : agrégées)
         self._suivi_reconstruction = False
         self._timer_suivi = QTimer(self)
         self._timer_suivi.setSingleShot(True)
@@ -928,7 +929,7 @@ class FenetrePrincipale(QMainWindow):
     # Les colonnes qui servent au classement d'abord : elles doivent tenir à l'écran sans défiler.
     COLONNES_SUIVI = ("#", "Config", "P(réussite)", "Sauvegarde", "Écart", "Levier", "Rend. 30j %",
                       "DD max %", "Rend/DD", "Trades", "Challenge -30j", "Sortie / direction",
-                      "Données", "Note")
+                      "Données", "Groupes", "Note")
     C_SUIVI_P = 2                        # colonne P(réussite) : le tri par défaut
 
     def _construire_suivi(self):
@@ -942,6 +943,17 @@ class FenetrePrincipale(QMainWindow):
         self.combo_suivi_tf = QComboBox()
         for combo in (self.combo_suivi_sym, self.combo_suivi_tf):
             combo.currentIndexChanged.connect(lambda _: self._remplir_suivi())
+        self.combo_suivi_groupe = QComboBox()
+        self.combo_suivi_groupe.setToolTip(
+            "Un groupe est un ensemble de configs à suivre ensemble. Le choisir n'affiche que ses "
+            "configs, toutes sélectionnées : le graphique montre aussitôt leur portefeuille.")
+        self.combo_suivi_groupe.currentIndexChanged.connect(self._groupe_choisi)
+        self.bouton_groupe = QToolButton()
+        self.bouton_groupe.setText("Groupe ▾")
+        self.bouton_groupe.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.menu_groupe = QMenu(self.bouton_groupe)
+        self.menu_groupe.aboutToShow.connect(self._construire_menu_groupe)
+        self.bouton_groupe.setMenu(self.menu_groupe)
         self.bouton_suivi = QPushButton("Actualiser")
         self.bouton_suivi.setToolTip(
             "Rejoue les configs affichées sur les 30 derniers jours des données du cache, en "
@@ -958,6 +970,9 @@ class FenetrePrincipale(QMainWindow):
         h.addWidget(self.combo_suivi_sym)
         h.addWidget(QLabel("Timeframe"))
         h.addWidget(self.combo_suivi_tf)
+        h.addWidget(QLabel("Groupe"))
+        h.addWidget(self.combo_suivi_groupe)
+        h.addWidget(self.bouton_groupe)
         h.addWidget(self.bouton_suivi)
         h.addWidget(self.barre_suivi)
         h.addWidget(self.label_suivi, 1)
@@ -982,13 +997,44 @@ class FenetrePrincipale(QMainWindow):
                     "ou fixe). Rouge : la limite du challenge est atteinte."),
                 (10, "Issue d'un challenge qui aurait démarré au début du mois.")):
             self.table_suivi.horizontalHeaderItem(col).setToolTip(aide)
+        self.table_suivi.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table_suivi.setToolTip(
+            "Ctrl+clic ou Maj+clic : sélection multiple. Avec deux configs ou plus, le graphique "
+            "montre le portefeuille qu'elles forment.")
         self.table_suivi.itemSelectionChanged.connect(self._suivi_selectionne)
         self.vue_suivi = PlotlyView()
         self.vue_suivi.clic.connect(self._clic_suivi)
 
+        self.combo_agregat = QComboBox()
+        for cle, texte in suivi.MODES_AGREGAT.items():
+            self.combo_agregat.addItem(texte, cle)
+        self.combo_agregat.setToolTip(
+            "Capital partagé : le capital est réparti à parts égales entre les configs choisies "
+            "(equity du portefeuille = moyenne des equities).\nCumul : chaque config tourne sur "
+            "tout le capital à son levier, gains et pertes s'additionnent (exposition = somme des "
+            "leviers).")
+        self.combo_agregat.currentIndexChanged.connect(lambda _: self._maj_graphique_suivi())
+        self.label_agregat = QLabel()
+        self.label_agregat.setWordWrap(True)
+        self.label_agregat.setTextFormat(Qt.TextFormat.RichText)
+        self.bandeau_agregat = QWidget()
+        b = QVBoxLayout(self.bandeau_agregat)
+        b.setContentsMargins(0, 0, 0, 0)
+        ligne = QHBoxLayout()
+        ligne.addWidget(QLabel("Portefeuille"))
+        ligne.addWidget(self.combo_agregat, 1)
+        b.addLayout(ligne)
+        b.addWidget(self.label_agregat)
+        self.bandeau_agregat.setVisible(False)
+        droite = QWidget()
+        d = QVBoxLayout(droite)
+        d.setContentsMargins(0, 0, 0, 0)
+        d.addWidget(self.bandeau_agregat)
+        d.addWidget(self.vue_suivi, 1)
+
         corps = QSplitter(Qt.Orientation.Horizontal)
         corps.addWidget(self.table_suivi)
-        corps.addWidget(self.vue_suivi)
+        corps.addWidget(droite)
         corps.setStretchFactor(0, 5)
         corps.setStretchFactor(1, 3)
         corps.setSizes([720, 430])
@@ -999,8 +1045,10 @@ class FenetrePrincipale(QMainWindow):
     def _configs_affichees(self):
         """Configs qui passent les filtres symbole et timeframe, la plus récente d'abord."""
         sym, tf = self.combo_suivi_sym.currentData(), self.combo_suivi_tf.currentData()
+        groupe = self._groupes.get(self.combo_suivi_groupe.currentData())
         return [c for c in self._configs.values()
-                if (sym is None or c.symbole == sym) and (tf is None or c.unite == tf)]
+                if (sym is None or c.symbole == sym) and (tf is None or c.unite == tf)
+                and (groupe is None or c.id in groupe.ids)]
 
     def _maj_filtres_suivi(self):
         """Les valeurs des filtres viennent des configs sauvegardées ; on garde le choix en cours."""
@@ -1016,6 +1064,113 @@ class FenetrePrincipale(QMainWindow):
             i = combo.findData(choix)
             combo.setCurrentIndex(max(i, 0))
             combo.blockSignals(False)
+        choix = self.combo_suivi_groupe.currentData()
+        self.combo_suivi_groupe.blockSignals(True)
+        self.combo_suivi_groupe.clear()
+        self.combo_suivi_groupe.addItem("Tous", None)
+        for g in self._groupes.values():
+            self.combo_suivi_groupe.addItem(f"{g.nom} ({len(g.ids)})", g.id)
+        self.combo_suivi_groupe.setCurrentIndex(max(self.combo_suivi_groupe.findData(choix), 0))
+        self.combo_suivi_groupe.blockSignals(False)
+
+    # ---- groupes
+
+    def _groupe_courant(self):
+        return self._groupes.get(self.combo_suivi_groupe.currentData())
+
+    def _groupe_choisi(self, *_):
+        """Choisir un groupe affiche ses configs et les sélectionne toutes : leur portefeuille
+        apparaît au graphique. Les filtres symbole et timeframe sont remis à « Tous », sinon
+        ils masqueraient des membres du groupe."""
+        for combo in (self.combo_suivi_sym, self.combo_suivi_tf):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        groupe = self._groupe_courant()
+        if groupe is not None:
+            self._suivi_ids = list(groupe.ids)
+        self._remplir_suivi()
+
+    def _recharger_groupes(self, choisir=None):
+        try:
+            self._groupes = {g.id: g for g in configs.lister_groupes()}
+        except Exception as e:
+            self._groupes = {}
+            self.statusBar().showMessage(f"Groupes illisibles : {e}", 8000)
+        self._maj_filtres_suivi()
+        if choisir is None:
+            self._remplir_suivi()
+            return
+        self.combo_suivi_groupe.blockSignals(True)
+        self.combo_suivi_groupe.setCurrentIndex(max(self.combo_suivi_groupe.findData(choisir), 0))
+        self.combo_suivi_groupe.blockSignals(False)
+        self._groupe_choisi()
+
+    def _construire_menu_groupe(self):
+        m = self.menu_groupe
+        m.clear()
+        groupe = self._groupe_courant()
+        selection = list(self._suivi_ids)
+        n = len(selection)
+        m.addAction(f"Nouveau groupe avec la sélection ({n})…", self._nouveau_groupe).setEnabled(n > 0)
+        ajouter = m.addMenu("Ajouter la sélection à")
+        ajouter.setEnabled(n > 0 and bool(self._groupes))
+        for g in self._groupes.values():
+            ajouter.addAction(g.nom, lambda g=g: self._groupe_ajouter(g))
+        m.addSeparator()
+        m.addAction("Retirer la sélection de ce groupe", self._groupe_retirer).setEnabled(
+            groupe is not None and n > 0)
+        m.addAction("Renommer le groupe…", self._groupe_renommer).setEnabled(groupe is not None)
+        m.addAction("Supprimer le groupe", self._groupe_supprimer).setEnabled(groupe is not None)
+
+    def _demander_nom(self, titre, defaut=""):
+        nom, ok = QInputDialog.getText(self, titre, "Nom du groupe :", text=defaut)
+        return nom.strip() if ok and nom.strip() else None
+
+    def _groupe_action(self, fonction, *args, choisir=None):
+        try:
+            fonction(*args)
+        except Exception as e:
+            QMessageBox.warning(self, "Groupe", str(e))
+            return False
+        self._recharger_groupes(choisir)
+        return True
+
+    def _nouveau_groupe(self):
+        nom = self._demander_nom("Nouveau groupe")
+        if nom is None:
+            return
+        try:
+            id_groupe = configs.creer_groupe(nom, self._suivi_ids)
+        except Exception as e:
+            QMessageBox.warning(self, "Groupe", str(e))
+            return
+        self._recharger_groupes(choisir=id_groupe)
+
+    def _groupe_ajouter(self, groupe):
+        if self._groupe_action(configs.ajouter_au_groupe, groupe.id, self._suivi_ids):
+            self.statusBar().showMessage(f"Ajouté au groupe « {groupe.nom} ».", 4000)
+
+    def _groupe_retirer(self):
+        g = self._groupe_courant()
+        if g is not None:
+            self._groupe_action(configs.retirer_du_groupe, g.id, self._suivi_ids, choisir=g.id)
+
+    def _groupe_renommer(self):
+        g = self._groupe_courant()
+        nom = self._demander_nom("Renommer le groupe", g.nom) if g is not None else None
+        if nom is not None:
+            self._groupe_action(configs.renommer_groupe, g.id, nom, choisir=g.id)
+
+    def _groupe_supprimer(self):
+        g = self._groupe_courant()
+        if g is None:
+            return
+        Bouton = QMessageBox.StandardButton
+        if QMessageBox.question(self, "Supprimer", f"Supprimer le groupe « {g.nom} » ? Ses configs "
+                                "restent sauvegardées.", Bouton.Yes | Bouton.No,
+                                Bouton.No) == Bouton.Yes:
+            self._groupe_action(configs.supprimer_groupe, g.id)
 
     def _lancer_suivi(self):
         """Actualiser / Stop : rejoue les configs affichées en tâche de fond."""
@@ -1109,7 +1264,8 @@ class FenetrePrincipale(QMainWindow):
                 ]
                 donnees = _Num(f"{_jour(r.derniere_bougie)} ({retard} j)", -retard,
                                brush=ROUGE if retard > FRAICHEUR_MAX_JOURS else None)
-            for j, item in enumerate(debut + milieu + fin + [donnees, _cellule(note)]):
+            groupes = ", ".join(g.nom for g in self._groupes.values() if c.id in g.ids)
+            for j, item in enumerate(debut + milieu + fin + [donnees, _cellule(groupes), _cellule(note)]):
                 t.setItem(i, j, item)
             t.item(i, 0).setData(Qt.ItemDataRole.UserRole, c.id)
             t.item(i, 0).setToolTip(configs.resume(c))
@@ -1117,10 +1273,11 @@ class FenetrePrincipale(QMainWindow):
         t.sortItems(colonne, sens)
 
         ids = [t.item(i, 0).data(Qt.ItemDataRole.UserRole) for i in range(t.rowCount())]
-        if self._suivi_choisi not in ids:
-            self._suivi_choisi = ids[0] if ids else None
-        if self._suivi_choisi is not None:
-            t.selectRow(ids.index(self._suivi_choisi))
+        self._suivi_ids = [i for i in self._suivi_ids if i in ids] or ids[:1]
+        for id_config in self._suivi_ids:
+            t.selectionModel().select(
+                t.model().index(ids.index(id_config), 0),
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         self._suivi_reconstruction = False
         self._maj_etat_suivi(affichees)
         self._maj_graphique_suivi()
@@ -1142,7 +1299,8 @@ class FenetrePrincipale(QMainWindow):
         lignes = self.table_suivi.selectionModel().selectedRows()
         if not lignes:
             return
-        self._suivi_choisi = self.table_suivi.item(lignes[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        self._suivi_ids = [self.table_suivi.item(l.row(), 0).data(Qt.ItemDataRole.UserRole)
+                           for l in sorted(lignes, key=lambda l: l.row())]
         self._maj_graphique_suivi()
 
     def _clic_suivi(self, point):
@@ -1159,9 +1317,39 @@ class FenetrePrincipale(QMainWindow):
         libelles = {c.id: f"#{c.id} {c.symbole} {c.unite.upper()} {c.entree_type}→{c.sortie_type} "
                           f"{c.rapide}/{c.lente} x{s.levier:g}" for c, s in calcules}
         suivis = [s for _, s in calcules]
-        regles = next((s.regles for s in suivis if s.id == self._suivi_choisi),
-                      suivis[0].regles if suivis else propfirm.Regles())
-        self.vue_suivi.afficher(charts.figure_suivi(suivis, libelles, self._suivi_choisi, regles))
+        choisis = [s for s in suivis if s.id in self._suivi_ids]
+        agregat = None
+        if len(choisis) >= 2:
+            agregat = suivi.agreger(choisis, self.combo_agregat.currentData())
+            suivis = choisis                    # le reste n'est que du bruit à côté du portefeuille
+            regles = agregat.regles
+        else:
+            regles = choisis[0].regles if choisis else (
+                suivis[0].regles if suivis else propfirm.Regles())
+        self.bandeau_agregat.setVisible(agregat is not None)
+        if agregat is not None:
+            self.label_agregat.setText(self._texte_agregat(agregat))
+        self.vue_suivi.afficher(charts.figure_suivi(
+            suivis, libelles, self._suivi_ids[0] if self._suivi_ids else None, regles, agregat))
+
+    @staticmethod
+    def _texte_agregat(a):
+        """Statistiques du portefeuille, en une courte fiche sous le sélecteur de mode."""
+        def couleur(v):
+            return "#1a7f37" if v > 0 else "#cf222e" if v < 0 else "#666"
+        n = len(a.ids)
+        rd = "n/a" if a.rend_dd is None else f"{a.rend_dd:.1f}"
+        limite = ' style="color:#cf222e"' if a.dd_pct >= a.regles.dd_max_pct else ""
+        texte = (
+            f"<b>{n} configs</b> · rendement <b style='color:{couleur(a.rendement_pct)}'>"
+            f"{a.rendement_pct:+.1f} %</b> · DD max <b{limite}>{a.dd_pct:.1f} %</b> · "
+            f"Rend/DD <b>{rd}</b> · {a.n_trades} trades<br>"
+            f"Challenge -30j : <b>{charts.LIBELLES_ISSUE[a.issue]}</b> · "
+            f"{a.n_positives}/{n} configs positives · "
+            f"DD moyen des configs seules : {a.dd_moyen_pct:.1f} %")
+        if a.regles_differentes:
+            texte += "<br><i>Les configs n'ont pas les mêmes règles de challenge : celles de la première s'appliquent.</i>"
+        return texte
 
     # -------------------------------------------------------------- analyse
 
@@ -1632,6 +1820,10 @@ class FenetrePrincipale(QMainWindow):
         self.liste_configs.blockSignals(False)
         self._config_choisie()
         self._suivis = {i: r for i, r in self._suivis.items() if i in self._configs}
+        try:
+            self._groupes = {g.id: g for g in configs.lister_groupes()}
+        except Exception:
+            self._groupes = {}
         self._maj_filtres_suivi()
         self._remplir_suivi()
 

@@ -106,16 +106,19 @@ def backtest_config(b, c: ConfigSauvee, haussiere):
     return engine.backtest(b, entrees, sorties, fees, slippage, capital, config=config)
 
 
+def _drawdown_pct(e, regles):
+    """Drawdown % (<= 0) d'une equity de base 1, selon la règle du challenge (suiveur ou fixe)."""
+    if regles.dd_trailing:
+        sommet = np.maximum.accumulate(np.maximum(e, 1.0))
+        return (e / sommet - 1.0) * 100
+    return np.minimum(e - 1.0, 0.0) * 100
+
+
 def _courbe_mois(eq, levier, regles):
     """(rendement %, drawdown %) au levier, à partir de l'equity du mois (première valeur = base)."""
     rends = np.maximum(1.0 + levier * np.diff(eq) / eq[:-1], 0.0)
     e = np.concatenate([[1.0], np.cumprod(rends)])
-    if regles.dd_trailing:
-        sommet = np.maximum.accumulate(np.maximum(e, 1.0))
-        dd = e / sommet - 1.0
-    else:
-        dd = np.minimum(e - 1.0, 0.0)
-    return (e - 1.0) * 100, dd * 100
+    return (e - 1.0) * 100, _drawdown_pct(e, regles)
 
 
 def _suivre_un(b, c, haussiere, annule):
@@ -204,3 +207,68 @@ def suivre(a_suivre, annule=lambda: False, racine=None):
                 return
             except Exception as e:
                 yield c, f"{type(e).__name__} : {e}"
+
+
+MODES_AGREGAT = {
+    "partage": "Capital partagé (moyenne)",
+    "cumul": "Cumul (chaque config sur tout le capital)",
+}
+
+
+@dataclass(frozen=True)
+class Agregat:
+    """Plusieurs configs suivies, comme un seul portefeuille sur le dernier mois."""
+    ids: tuple
+    mode: str
+    regles: propfirm.Regles      # celles de la première config ; `regles_differentes` le signale
+    regles_differentes: bool
+    temps: np.ndarray            # grille commune : union des barres des configs
+    rendement: np.ndarray        # % depuis le début du mois
+    drawdown: np.ndarray         # % (<= 0), selon la règle du challenge
+    rendement_pct: float
+    dd_pct: float                # DD max du portefeuille, positif
+    dd_moyen_pct: float          # moyenne des DD max individuels : l'écart mesure la diversification
+    n_trades: int
+    n_positives: int             # configs dont le rendement du mois est positif
+    issue: str                   # challenge parti il y a un mois, sur le portefeuille
+
+    @property
+    def rend_dd(self):
+        return self.rendement_pct / self.dd_pct if self.dd_pct else None
+
+
+def agreger(suivis, mode="partage"):
+    """Portefeuille des `suivis` sur leur grille de temps commune.
+
+    Chaque config est déjà au levier de sa sauvegarde ; on lit son equity en escalier (la
+    dernière valeur connue) sur l'union de leurs barres. Deux lectures :
+    - « partage » : le capital est réparti à parts égales, l'equity du portefeuille est la
+      moyenne des equities (la diversification joue à plein) ;
+    - « cumul » : chaque config tourne sur tout le capital, les gains et pertes s'additionnent
+      (l'exposition totale est la somme des leviers).
+    La P(réussite) n'est pas agrégée : elle demande l'equity de toute la fenêtre, que le suivi ne
+    garde pas.
+    """
+    if not suivis:
+        raise ValueError("Rien à agréger.")
+    grille = np.unique(np.concatenate([s.temps for s in suivis]))
+    courbes = []
+    for s in suivis:
+        k = np.searchsorted(s.temps, grille, side="right") - 1
+        courbes.append(np.where(k >= 0, 1.0 + s.rendement[np.maximum(k, 0)] / 100, 1.0))
+    courbes = np.array(courbes)
+    e = courbes.mean(axis=0) if mode == "partage" else 1.0 + (courbes - 1.0).sum(axis=0)
+    e = np.maximum(e, 1e-9)                    # un compte ruiné reste défini pour les rendements
+    regles = suivis[0].regles
+    drawdown = _drawdown_pct(e, regles)
+    try:
+        issue = propfirm.issue_depuis_le_debut(e, grille, regles)
+    except (ValueError, IndexError):
+        issue = "TEMPS"
+    return Agregat(
+        ids=tuple(s.id for s in suivis), mode=mode, regles=regles,
+        regles_differentes=any(s.regles != regles for s in suivis), temps=grille,
+        rendement=(e - 1.0) * 100, drawdown=drawdown, rendement_pct=float((e[-1] - 1.0) * 100),
+        dd_pct=float(-drawdown.min()), dd_moyen_pct=float(np.mean([s.dd_pct for s in suivis])),
+        n_trades=sum(s.n_trades for s in suivis),
+        n_positives=sum(s.rendement_pct > 0 for s in suivis), issue=issue)
