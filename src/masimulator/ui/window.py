@@ -701,6 +701,14 @@ class FenetrePrincipale(QMainWindow):
             h.addWidget(widget)
         h.addWidget(self.bouton_tendance)
         h.addStretch(1)
+        self.check_propre = QCheckBox("Sans collision")
+        self.check_propre.setToolTip(
+            "Masque les paires où un signal d'entrée et un signal de sortie tombent sur la même "
+            "barre pendant une position. Ces collisions sont corrigées dans la simulation (sortie "
+            "prioritaire, entrée reportée d'une barre) mais la réouverture a une barre de retard "
+            "sur BotX : ces paires sont les plus sensibles à ce détail de timing.")
+        self.check_propre.toggled.connect(lambda _: self._maj_crible())
+        h.addWidget(self.check_propre)
         self._maj_champs_tendance()
 
         self.table_crible = _tableau([], etirer=False)
@@ -1131,10 +1139,22 @@ class FenetrePrincipale(QMainWindow):
             return
         leviers, hasard = self.params.leviers, self.params.regles.hasard_pur()
         colonnes = (["Entrée", "Sortie", "Trades", "Rend. %", "DD %", "Sharpe", "PF", "Réussite %"]
-                    + [f"P x{lev:g}" for lev in leviers] + ["Meilleur P", "Levier", "Écart (pts)"])
+                    + [f"P x{lev:g}" for lev in leviers]
+                    + ["Meilleur P", "Levier", "Écart (pts)", "Collisions", "Marge min", "Ignorées"])
         t.setColumnCount(len(colonnes))
         t.setHorizontalHeaderLabels(colonnes)
-        for l in r.lignes:
+        n = len(colonnes)
+        for j, aide in ((n - 3, "Barres où un signal d'entrée et un signal de sortie coïncident pendant une "
+                                "position. Corrigées : la sortie est prioritaire et l'entrée est reportée "
+                                "d'une barre (BotX ferme et rouvre sur la même barre)."),
+                        (n - 2, "Plus petit nombre de barres entre une sortie sur signal et le signal "
+                                "d'entrée suivant (1 = la barre d'après)."),
+                        (n - 1, "Signaux d'entrée reçus alors qu'une position était déjà ouverte, sans "
+                                "effet (BotX les ignore aussi), sur le total des signaux d'entrée.")):
+            t.horizontalHeaderItem(j).setToolTip(aide)
+        lignes = [l for l in r.lignes
+                  if not (self.check_propre.isChecked() and l.chevauchement and l.chevauchement.n_collisions)]
+        for l in lignes:
             i = t.rowCount()
             t.insertRow(i)
             lev, p = l.meilleur_levier()
@@ -1159,6 +1179,12 @@ class FenetrePrincipale(QMainWindow):
                 _Num(f"{round((p - hasard) * 100):+d}" if avec_p else "-",
                      (p - hasard) * 100 if avec_p else None),
             ]
+            ch = l.chevauchement
+            cellules += [
+                _Num(str(ch.n_collisions), ch.n_collisions, ROUGE if ch.n_collisions else None),
+                _Num(_n(ch.marge_min, "d"), ch.marge_min),
+                _Num(f"{ch.n_ignorees}/{ch.n_signaux_entree}", ch.n_ignorees),
+            ] if ch else [_Num("-"), _Num("-"), _Num("-")]
             for j, cellule in enumerate(cellules):
                 t.setItem(i, j, cellule)
             t.item(i, 0).setData(Qt.ItemDataRole.UserRole, (l.entree_type, l.sortie_type))
@@ -1245,7 +1271,8 @@ class FenetrePrincipale(QMainWindow):
             "dd_pct": ligne.dd_pct, "sharpe": ligne.sharpe, "win_rate_pct": ligne.win_rate_pct,
             "profit_factor": ligne.profit_factor, "p_reussite": ligne.p_reussite,
             "meilleur_levier": lev, "meilleur_p": meilleur_p if ligne.p_reussite else None,
-            "hasard": p.regles.hasard_pur()}}
+            "hasard": p.regles.hasard_pur(),
+            "chevauchement": asdict(ligne.chevauchement) if ligne.chevauchement else None}}
         if pol is not None:
             metriques["politique"] = {**asdict(pol), "botx_params": pol.parametres_botx,
                                       "risque_botx": pol.risque_botx}
@@ -1599,6 +1626,8 @@ class FenetrePrincipale(QMainWindow):
             ("Frais", f("total_fees_paid", ",.0f")),
             ("Exposition", f("exposure_pct", ".0f", " %")),
         ]
+        if res.collisions:
+            blocs.append(("Collisions corrigées", str(res.collisions)))
         self.label_kpi.setText("&nbsp;&nbsp;·&nbsp;&nbsp;".join(
             f"<span style='color:#666'>{k}</span> <b>{v}</b>" for k, v in blocs))
 

@@ -223,6 +223,14 @@ def resume(c: Config):
                         f"(hasard {_pct(cr.get('hasard'))})")
         lignes.append(f"Au moment de la sauvegarde (criblage, long seul) : {cr['n_trades']} trades, "
                       f"{cr['rendement_pct']:+.1f} %, DD {cr['dd_pct']:.1f} %{meilleur}")
+        ch = cr.get("chevauchement")
+        if ch:
+            marge = f", marge min {ch['marge_min']} barre(s)" if ch.get("marge_min") is not None else ""
+            lignes.append(
+                f"  Chevauchements : {ch['n_collisions']} collision(s){marge}, "
+                f"{ch['n_ignorees']}/{ch['n_signaux_entree']} entrées ignorées"
+                + (" (paire propre)" if not ch["n_collisions"]
+                   else " corrigée(s) : entrée reportée d'une barre, comme BotX à une barre près"))
     for cle, titre in (("politique", "Sortie"), ("direction", "Direction")):
         d = m.get(cle)
         if d:
