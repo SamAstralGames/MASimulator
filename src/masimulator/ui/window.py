@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from .. import cli, configs, data, engine, labo, moyennes, propfirm
+from .. import cli, configs, data, engine, labo, moyennes, propfirm, suivi
 from .. import tendance as tend
 from . import charts
 from .webview import PlotlyView
@@ -111,6 +111,31 @@ class Tache(QThread):
                 lambda: self._annule,
                 self.journal.emit))
         except Exception as e:                       # remonté à l'utilisateur
+            self.echec.emit(f"{type(e).__name__} : {e}")
+
+
+class TacheSuivi(QThread):
+    """Rejoue des configs sauvegardées sur le dernier mois, en émettant chaque résultat dès qu'il
+    est prêt : arrêter la tâche laisse ce qui est déjà calculé."""
+
+    resultat = Signal(int, object)         # id de la config, suivi.Suivi ou message d'erreur
+    progres = Signal(int, int)
+    echec = Signal(str)
+
+    def __init__(self, a_suivre, parent=None):
+        super().__init__(parent)
+        self._a_suivre = list(a_suivre)
+        self._annule = False
+
+    def annuler(self):
+        self._annule = True
+
+    def run(self):
+        try:
+            for fait, (c, r) in enumerate(suivi.suivre(self._a_suivre, lambda: self._annule), 1):
+                self.resultat.emit(c.id, r)
+                self.progres.emit(fait, len(self._a_suivre))
+        except Exception as e:
             self.echec.emit(f"{type(e).__name__} : {e}")
 
 
@@ -259,6 +284,13 @@ class FenetrePrincipale(QMainWindow):
         self._labo_lignes = ([], [])       # (politiques, long/short) de la paire affichée
         self._a_restaurer = None           # paire à resélectionner après une analyse
         self._configs = {}                 # id -> configs.ConfigSauvee, onglet Configs
+        self._suivis = {}                  # id -> suivi.Suivi ou message d'erreur, vue d'ensemble
+        self._tache_suivi: TacheSuivi | None = None
+        self._suivi_choisi = None          # config en couleur sur le graphique du suivi
+        self._suivi_reconstruction = False
+        self._timer_suivi = QTimer(self)
+        self._timer_suivi.setSingleShot(True)
+        self._timer_suivi.timeout.connect(self._remplir_suivi)
         self._timer_labo = QTimer(self)
         self._timer_labo.setSingleShot(True)
         self._timer_labo.timeout.connect(self._lancer_labo)
@@ -288,11 +320,13 @@ class FenetrePrincipale(QMainWindow):
 
         self._charger_symboles()
         self._rafraichir_configs()
+        QTimer.singleShot(0, self._lancer_suivi)      # le calcul démarre en fond dès l'ouverture
 
     def closeEvent(self, event):
         """Interrompt les calculs en cours et attend leurs threads avant de quitter."""
         self._enregistrer_note()
-        taches = list(self._labos_en_cours) + ([self._tache] if self._tache is not None else [])
+        taches = list(self._labos_en_cours) + [t for t in (self._tache, self._tache_suivi)
+                                                if t is not None]
         for tache in taches:
             tache.annuler()
         for tache in taches:
@@ -656,9 +690,17 @@ class FenetrePrincipale(QMainWindow):
         self.texte_alertes.setPlaceholderText(
             "Lance une analyse, puis sélectionne un symbole pour voir ses alertes de données. "
             "Double-clic : ouvre son criblage.")
+        v.setContentsMargins(0, 0, 0, 0)
         v.addWidget(self.table_apercu, 1)
         v.addWidget(self.texte_alertes)
-        self.onglets.addTab(w, ONGLETS[T_APERCU])
+        # La vue d'ensemble est divisée : les symboles analysés en haut, le suivi des configs
+        # sauvegardées (leur dernier mois) en bas.
+        division = QSplitter(Qt.Orientation.Vertical)
+        division.addWidget(w)
+        division.addWidget(self._construire_suivi())
+        division.setStretchFactor(1, 1)
+        division.setSizes([190, 660])
+        self.onglets.addTab(division, ONGLETS[T_APERCU])
 
         # Criblage
         w = QWidget()
@@ -873,6 +915,246 @@ class FenetrePrincipale(QMainWindow):
         v.addWidget(self.label_cmp)
         v.addWidget(self.vue_cmp, 1)
         self.onglets.addTab(w, ONGLETS[T_COMPARAISON])
+
+    # ------------------------------------------- suivi des configs sauvegardées
+
+    # Les colonnes qui servent au classement d'abord : elles doivent tenir à l'écran sans défiler.
+    COLONNES_SUIVI = ("#", "Config", "P(réussite)", "Sauvegarde", "Écart", "Levier", "Rend. 30j %",
+                      "DD max %", "Rend/DD", "Trades", "Challenge -30j", "Sortie / direction",
+                      "Données", "Note")
+    C_SUIVI_P = 2                        # colonne P(réussite) : le tri par défaut
+
+    def _construire_suivi(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 4, 0, 0)
+        h = QHBoxLayout()
+        titre = QLabel("Configs sauvegardées : le dernier mois")
+        titre.setStyleSheet("font-weight: bold;")
+        self.combo_suivi_sym = QComboBox()
+        self.combo_suivi_tf = QComboBox()
+        for combo in (self.combo_suivi_sym, self.combo_suivi_tf):
+            combo.currentIndexChanged.connect(lambda _: self._remplir_suivi())
+        self.bouton_suivi = QPushButton("Actualiser")
+        self.bouton_suivi.setToolTip(
+            "Rejoue les configs affichées sur les 30 derniers jours des données du cache, en "
+            "tâche de fond. Stop interrompt le calcul et garde ce qui est déjà affiché.")
+        self.bouton_suivi.clicked.connect(self._lancer_suivi)
+        self.barre_suivi = QProgressBar()
+        self.barre_suivi.setMaximumWidth(160)
+        self.barre_suivi.setVisible(False)
+        self.label_suivi = QLabel()
+        self.label_suivi.setStyleSheet("color: #666;")
+        h.addWidget(titre)
+        h.addSpacing(16)
+        h.addWidget(QLabel("Symbole"))
+        h.addWidget(self.combo_suivi_sym)
+        h.addWidget(QLabel("Timeframe"))
+        h.addWidget(self.combo_suivi_tf)
+        h.addWidget(self.bouton_suivi)
+        h.addWidget(self.barre_suivi)
+        h.addWidget(self.label_suivi, 1)
+
+        self.table_suivi = _tableau(list(self.COLONNES_SUIVI))
+        self.table_suivi.setAlternatingRowColors(True)
+        entete = self.table_suivi.horizontalHeader()
+        entete.setSortIndicator(self.C_SUIVI_P, Qt.SortOrder.DescendingOrder)
+        self.table_suivi.setSortingEnabled(True)
+        self.table_suivi.horizontalHeader().setSectionResizeMode(
+            len(self.COLONNES_SUIVI) - 1, QHeaderView.ResizeMode.Interactive)
+        self.table_suivi.setColumnWidth(len(self.COLONNES_SUIVI) - 1, 200)
+        for col, aide in (
+                (2, "P(réussite) d'un challenge sur la fenêtre de la config (sa longueur "
+                    "d'origine), arrêtée à la dernière bougie."),
+                (3, "P(réussite) enregistrée au moment de la sauvegarde."),
+                (4, "P(réussite) d'aujourd'hui moins celle de la sauvegarde : négatif = la config "
+                    "s'est dégradée."),
+                (6, "Rendement des 30 derniers jours, au levier de la config (celui de la "
+                    "sauvegarde), en repartant de 0 au début du mois."),
+                (7, "Pire drawdown du mois au même levier, selon la règle du challenge (suiveur "
+                    "ou fixe). Rouge : la limite du challenge est atteinte."),
+                (10, "Issue d'un challenge qui aurait démarré au début du mois.")):
+            self.table_suivi.horizontalHeaderItem(col).setToolTip(aide)
+        self.table_suivi.itemSelectionChanged.connect(self._suivi_selectionne)
+        self.vue_suivi = PlotlyView()
+        self.vue_suivi.clic.connect(self._clic_suivi)
+
+        corps = QSplitter(Qt.Orientation.Horizontal)
+        corps.addWidget(self.table_suivi)
+        corps.addWidget(self.vue_suivi)
+        corps.setStretchFactor(0, 5)
+        corps.setStretchFactor(1, 3)
+        corps.setSizes([720, 430])
+        v.addLayout(h)
+        v.addWidget(corps, 1)
+        return w
+
+    def _configs_affichees(self):
+        """Configs qui passent les filtres symbole et timeframe, la plus récente d'abord."""
+        sym, tf = self.combo_suivi_sym.currentData(), self.combo_suivi_tf.currentData()
+        return [c for c in self._configs.values()
+                if (sym is None or c.symbole == sym) and (tf is None or c.unite == tf)]
+
+    def _maj_filtres_suivi(self):
+        """Les valeurs des filtres viennent des configs sauvegardées ; on garde le choix en cours."""
+        for combo, valeurs in ((self.combo_suivi_sym, sorted({c.symbole for c in self._configs.values()})),
+                               (self.combo_suivi_tf, sorted({c.unite for c in self._configs.values()},
+                                                            key=lambda u: data.MINUTES[u]))):
+            choix = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Tous", None)
+            for x in valeurs:
+                combo.addItem(x.upper() if combo is self.combo_suivi_tf else x, x)
+            i = combo.findData(choix)
+            combo.setCurrentIndex(max(i, 0))
+            combo.blockSignals(False)
+
+    def _lancer_suivi(self):
+        """Actualiser / Stop : rejoue les configs affichées en tâche de fond."""
+        if self._tache_suivi is not None and self._tache_suivi.isRunning():
+            self._tache_suivi.annuler()
+            self.bouton_suivi.setEnabled(False)
+            return
+        a_suivre = self._configs_affichees()
+        if not a_suivre:
+            return
+        tache = TacheSuivi(a_suivre, self)
+        self._tache_suivi = tache
+        self.bouton_suivi.setText("Stop")
+        self.barre_suivi.setRange(0, len(a_suivre))
+        self.barre_suivi.setValue(0)
+        self.barre_suivi.setVisible(True)
+
+        def resultat(id_config, r):
+            self._suivis[id_config] = r
+            self._timer_suivi.start(250)          # regroupe les résultats qui arrivent en rafale
+
+        def fini():
+            self.barre_suivi.setVisible(False)
+            self.bouton_suivi.setText("Actualiser")
+            self.bouton_suivi.setEnabled(True)
+            if self._tache_suivi is tache:
+                self._tache_suivi = None
+            tache.deleteLater()
+            self._remplir_suivi()
+
+        tache.resultat.connect(resultat)
+        tache.progres.connect(lambda fait, total: self.barre_suivi.setValue(fait))
+        tache.echec.connect(lambda m: self.label_suivi.setText(f"Suivi interrompu : {m}"))
+        tache.finished.connect(fini)
+        tache.start()
+        self._remplir_suivi()
+
+    @staticmethod
+    def _strategie_suivi(c):
+        """Sortie et direction de la config ; le filtre de tendance du criblage s'ajoute au long seul."""
+        direction = c.direction or "long seul"
+        if "direction" not in c.metriques and c.tendance.active:
+            direction += " (tendance)"
+        return f"{c.politique} · {direction}"
+
+    def _remplir_suivi(self):
+        """Reconstruit le tableau et le graphique. Les configs pas encore calculées y figurent
+        déjà, en attente ; le tri en cours (colonne et sens) est conservé."""
+        self._timer_suivi.stop()
+        t = self.table_suivi
+        affichees = self._configs_affichees()
+        entete = t.horizontalHeader()
+        colonne, sens = entete.sortIndicatorSection(), entete.sortIndicatorOrder()
+        self._suivi_reconstruction = True
+        t.setSortingEnabled(False)
+        t.setRowCount(0)
+        gris = QBrush(QColor("#999999"))
+        for c in affichees:
+            i = t.rowCount()
+            t.insertRow(i)
+            r = self._suivis.get(c.id)
+            note = c.note.strip().splitlines()[0] if c.note.strip() else ""
+            debut = [_Num(f"#{c.id}", c.id),
+                     _cellule(f"{c.symbole} {c.unite.upper()}  {c.entree_type}→{c.sortie_type} "
+                              f"{c.rapide}/{c.lente}")]
+            fin = [_cellule(self._strategie_suivi(c))]
+            if not isinstance(r, suivi.Suivi):
+                milieu = [_Num("erreur" if r else "…", brush=gris) for _ in range(9)]
+                donnees = _Num("…", brush=gris)
+                if r:
+                    milieu[0].setToolTip(r)
+                    milieu[0].setForeground(ROUGE)
+            else:
+                retard = _retard_jours(r.derniere_bougie)
+                p, ps = r.p_actuelle, r.p_sauvee
+                ecart = None if p is None or ps is None else p - ps
+                milieu = [
+                    _Num("n/a" if p is None else f"{p * 100:.0f} %", p,
+                         fond=None if p is None else _fond_p(p)),
+                    _Num("n/a" if ps is None else f"{ps * 100:.0f} %", ps),
+                    _Num("n/a" if ecart is None else f"{ecart * 100:+.0f} pts", ecart,
+                         brush=_signe(ecart)),
+                    _Num(f"x{r.levier:g}", r.levier),
+                    _Num(f"{r.rendement_pct:+.1f}", r.rendement_pct, brush=_signe(r.rendement_pct)),
+                    _Num(f"{r.dd_pct:.1f}", r.dd_pct,
+                         brush=ROUGE if r.dd_pct >= r.regles.dd_max_pct else None),
+                    _Num(_n(r.rend_dd, ".1f"), r.rend_dd),
+                    _Num(str(r.n_trades), r.n_trades),
+                    _cellule(charts.LIBELLES_ISSUE[r.issue],
+                             brush=ROUGE if r.issue.startswith("ECHEC") else None),
+                ]
+                donnees = _Num(f"{_jour(r.derniere_bougie)} ({retard} j)", -retard,
+                               brush=ROUGE if retard > FRAICHEUR_MAX_JOURS else None)
+            for j, item in enumerate(debut + milieu + fin + [donnees, _cellule(note)]):
+                t.setItem(i, j, item)
+            t.item(i, 0).setData(Qt.ItemDataRole.UserRole, c.id)
+            t.item(i, 0).setToolTip(configs.resume(c))
+        t.setSortingEnabled(True)
+        t.sortItems(colonne, sens)
+
+        ids = [t.item(i, 0).data(Qt.ItemDataRole.UserRole) for i in range(t.rowCount())]
+        if self._suivi_choisi not in ids:
+            self._suivi_choisi = ids[0] if ids else None
+        if self._suivi_choisi is not None:
+            t.selectRow(ids.index(self._suivi_choisi))
+        self._suivi_reconstruction = False
+        self._maj_etat_suivi(affichees)
+        self._maj_graphique_suivi()
+
+    def _maj_etat_suivi(self, affichees):
+        if not self._configs:
+            self.label_suivi.setText("Aucune config sauvegardée : sauvegarde-en depuis le Criblage.")
+            return
+        calculees = [self._suivis[c.id] for c in affichees if isinstance(self._suivis.get(c.id), suivi.Suivi)]
+        texte = f"{len(calculees)} sur {len(affichees)} calculées"
+        if calculees:
+            derniere = max(s.derniere_bougie for s in calculees)
+            texte += f"  ·  données jusqu'au {_jour(derniere)}"
+        self.label_suivi.setText(texte)
+
+    def _suivi_selectionne(self):
+        if self._suivi_reconstruction:
+            return
+        lignes = self.table_suivi.selectionModel().selectedRows()
+        if not lignes:
+            return
+        self._suivi_choisi = self.table_suivi.item(lignes[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        self._maj_graphique_suivi()
+
+    def _clic_suivi(self, point):
+        """Un clic sur une courbe la sélectionne dans le tableau."""
+        id_config = point.get("meta")
+        for i in range(self.table_suivi.rowCount()):
+            if self.table_suivi.item(i, 0).data(Qt.ItemDataRole.UserRole) == id_config:
+                self.table_suivi.selectRow(i)
+                break
+
+    def _maj_graphique_suivi(self):
+        calcules = [(c, self._suivis[c.id]) for c in self._configs_affichees()
+                    if isinstance(self._suivis.get(c.id), suivi.Suivi)]
+        libelles = {c.id: f"#{c.id} {c.symbole} {c.unite.upper()} {c.entree_type}→{c.sortie_type} "
+                          f"{c.rapide}/{c.lente} x{s.levier:g}" for c, s in calcules}
+        suivis = [s for _, s in calcules]
+        regles = next((s.regles for s in suivis if s.id == self._suivi_choisi),
+                      suivis[0].regles if suivis else propfirm.Regles())
+        self.vue_suivi.afficher(charts.figure_suivi(suivis, libelles, self._suivi_choisi, regles))
 
     # -------------------------------------------------------------- analyse
 
@@ -1342,6 +1624,9 @@ class FenetrePrincipale(QMainWindow):
             self.liste_configs.setCurrentRow(0)
         self.liste_configs.blockSignals(False)
         self._config_choisie()
+        self._suivis = {i: r for i, r in self._suivis.items() if i in self._configs}
+        self._maj_filtres_suivi()
+        self._remplir_suivi()
 
     def _config_choisie(self, *_):
         self._enregistrer_note()              # la note de la config qu'on quitte

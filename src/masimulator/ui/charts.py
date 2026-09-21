@@ -151,3 +151,61 @@ def heatmap_fenetres(z, colonnes, lignes, hover, titre, regles=None):
     if regles is not None:
         titre += f"   ·   hasard pur : {regles.hasard_pur() * 100:.0f} %"
     return _base(fig, titre)
+
+
+def figure_suivi(suivis, libelles, selection, regles: Regles):
+    """Le dernier mois de plusieurs configs : rendement, drawdown et P(réussite) glissante.
+
+    Trois panneaux sur le même axe temps (jamais deux échelles sur un même axe). Une seule
+    config est en couleur, celle qu'on regarde ; les autres restent en gris, lisibles au
+    survol : avec vingt courbes, vingt couleurs ne diraient plus rien. Chaque trace porte l'id
+    de sa config dans `meta`, pour qu'un clic sur la courbe la sélectionne dans le tableau.
+    """
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[0.4, 0.3, 0.3])
+    if not suivis:
+        fig.add_annotation(text="Aucune config calculée", showarrow=False, font=dict(size=14, color=GRIS),
+                           xref="paper", yref="paper", x=0.5, y=0.5)
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return _base(fig)
+
+    # la sélection en dernier : elle se dessine par-dessus
+    for s in sorted(suivis, key=lambda s: s.id == selection):
+        choisie = s.id == selection
+        ligne = dict(color=BLEU if choisie else "#B5B5B5", width=2.5 if choisie else 1)
+        nom = libelles.get(s.id, f"#{s.id}")
+        groupe = str(s.id)
+        entete = "<b>%{fullData.name}</b><br>%{x|%d %b %H:%M}<br>"
+
+        ir = _decimer(s.rendement, 600)
+        fig.add_trace(go.Scatter(
+            x=s.temps[ir], y=s.rendement[ir], mode="lines", name=nom, meta=s.id, line=ligne,
+            legendgroup=groupe, showlegend=choisie,
+            hovertemplate=entete + "rendement %{y:+.1f} %<extra></extra>"), row=1, col=1)
+        idd = _decimer(s.drawdown, 600)
+        fig.add_trace(go.Scatter(
+            x=s.temps[idd], y=s.drawdown[idd], mode="lines", name=nom, meta=s.id, line=ligne,
+            legendgroup=groupe, showlegend=False,
+            hovertemplate=entete + "drawdown %{y:.1f} %<extra></extra>"), row=2, col=1)
+        fig.add_trace(go.Scatter(
+            x=s.p_dates, y=s.p_valeurs * 100, mode="lines+markers", name=nom, meta=s.id,
+            line=ligne, marker=dict(size=7 if choisie else 4, color=ligne["color"]),
+            legendgroup=groupe, showlegend=False, connectgaps=False,
+            hovertemplate=entete + f"P(réussite) %{{y:.0f}} % (fenêtre {s.fenetre_jours} j)"
+                                   "<extra></extra>"), row=3, col=1)
+
+    ref = dict(width=1, dash="dash")
+    fig.add_hline(y=regles.cible_pct, line=dict(color=COULEURS_ISSUE["REUSSI"], **ref), row=1, col=1,
+                  annotation_text=f"cible +{regles.cible_pct:g} %", annotation_position="top left")
+    fig.add_hline(y=0, line=dict(color="#999", width=1), row=1, col=1)
+    fig.add_hline(y=-regles.dd_max_pct, line=dict(color=COULEURS_ISSUE["ECHEC_DD"], **ref), row=2, col=1,
+                  annotation_text=f"DD max -{regles.dd_max_pct:g} %", annotation_position="bottom left")
+    fig.add_hline(y=regles.hasard_pur() * 100, line=dict(color=GRIS, **ref), row=3, col=1,
+                  annotation_text=f"hasard pur {regles.hasard_pur() * 100:.0f} %",
+                  annotation_position="bottom left")
+    fig.update_yaxes(title="Rendement %", row=1, col=1)
+    fig.update_yaxes(title="DD %", row=2, col=1)
+    fig.update_yaxes(title="P(réussite) %", range=[0, 100], row=3, col=1)
+    fig.update_layout(hovermode="closest", legend=dict(orientation="h", y=1.08, x=0))
+    return _base(fig).update_layout(margin=dict(l=60, r=24, t=36, b=36))

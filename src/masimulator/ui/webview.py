@@ -38,7 +38,7 @@ function dessiner(fig) {
     g.removeAllListeners('plotly_click');
     g.on('plotly_click', d => {
       const p = d.points[0];
-      if (pont) pont.recevoir(JSON.stringify({x: p.x, y: p.y, pointNumber: p.pointNumber}));
+      if (pont) pont.recevoir(JSON.stringify({x: p.x, y: p.y, pointNumber: p.pointNumber, meta: p.data.meta ?? null}));
     });
   });
 }
@@ -68,7 +68,7 @@ class _Pont(QObject):
 
 
 class PlotlyView(QWebEngineView):
-    """Affiche une figure Plotly ; `clic` émet {x, y, pointNumber} du point cliqué."""
+    """Affiche une figure Plotly ; `clic` émet {x, y, pointNumber, meta} du point cliqué (meta : celui de la trace)."""
 
     clic = Signal(dict)
 

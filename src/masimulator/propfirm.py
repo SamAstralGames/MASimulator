@@ -97,6 +97,18 @@ def _un_challenge(rends, debuts_jour, longueurs_jour, regles):
     return "ECHEC_JOUR"
 
 
+def issue_depuis_le_debut(equity_curve, timestamps, regles, levier=1.0):
+    """Issue du challenge qui partirait à la première barre : UNE trajectoire, pas un échantillon
+    de départs (voir `simuler`). Sert à dire ce qu'aurait donné un challenge lancé au début de
+    la série."""
+    equity = np.asarray(equity_curve, float)
+    rends = (np.diff(equity) / equity[:-1]) * levier
+    jours = np.asarray(timestamps)[1:].astype("datetime64[D]").astype(np.int64)
+    debuts = np.concatenate([[0], np.flatnonzero(np.diff(jours) != 0) + 1])
+    longueurs = np.diff(np.append(debuts, len(jours)))
+    return _un_challenge(rends, debuts, longueurs, regles)
+
+
 def simuler(equity_curve, timestamps, regles=None, levier=1.0,
             n_departs=500, graine=42):
     """Lance `n_departs` challenges à des dates de départ différentes.

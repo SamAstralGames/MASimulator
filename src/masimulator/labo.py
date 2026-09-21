@@ -280,6 +280,29 @@ def noms_politiques():
     return list(politiques(0.0, 0.0, 10_000.0))
 
 
+# variante -> (long autorisé, short autorisé) ; le suffixe " (tendance)" ajoute le filtre de tendance
+DIRECTIONS = {"long seul": (True, False), "short seul": (False, True), "long + short": (True, True)}
+SUFFIXE_TENDANCE = " (tendance)"
+
+
+def decoder_direction(nom):
+    """(long autorisé, short autorisé, avec filtre de tendance) d'un nom de variante."""
+    base = nom.removesuffix(SUFFIXE_TENDANCE)
+    long_ok, short_ok = DIRECTIONS[base]
+    return long_ok, short_ok, nom.endswith(SUFFIXE_TENDANCE)
+
+
+def backtest_long_short(b: Bougies, signaux, long_ok, short_ok, filtre, config):
+    """Un backtest long/short façon BotX ; `filtre` : tendance haussière, ou None."""
+    brut = raptorbt.run_strategy_backtest(
+        _StrategieLongShort(*signaux, long_ok, short_ok, filtre),
+        b.timestamps_ns(), b.open, b.high, b.low, b.close, b.volume,
+        symbol=b.symbole, config=config,
+        account_type="margin",      # un short est refusé, en silence, sur un compte cash
+        leverage=1.0)
+    return engine.resultat_de(brut)
+
+
 def comparer_long_short(b: Bougies, signaux, couts: engine.Couts, regles, leviers,
                         n_departs=300, capital=10_000.0, haussiere=None,
                         politique="croisement seul", annule=None):
@@ -294,23 +317,16 @@ def comparer_long_short(b: Bougies, signaux, couts: engine.Couts, regles, levier
     fees, slippage = couts.fractions(float(np.median(b.close)))
     atr = raptorbt.atr(b.high, b.low, b.close, period=ATR_PERIODE)
     config_de = lambda: politiques(fees, slippage, capital)[politique]
-    variantes = [("long seul", True, False, None), ("short seul", False, True, None),
-                 ("long + short", True, True, None)]
+    noms = list(DIRECTIONS)
     if haussiere is not None:
-        variantes += [("long seul (tendance)", True, False, haussiere),
-                      ("short seul (tendance)", False, True, haussiere),
-                      ("long + short (tendance)", True, True, haussiere)]
+        noms += [n + SUFFIXE_TENDANCE for n in DIRECTIONS]
     lignes = []
-    for nom, long_ok, short_ok, filtre in variantes:
+    for nom in noms:
         if annule is not None and annule():
             break
-        brut = raptorbt.run_strategy_backtest(
-            _StrategieLongShort(*signaux, long_ok, short_ok, filtre),
-            b.timestamps_ns(), b.open, b.high, b.low, b.close, b.volume,
-            symbol=b.symbole, config=config_de(),
-            account_type="margin",      # un short est refusé, en silence, sur un compte cash
-            leverage=1.0)
-        res = engine.resultat_de(brut)
+        long_ok, short_ok, avec_tendance = decoder_direction(nom)
+        res = backtest_long_short(b, signaux, long_ok, short_ok,
+                                  haussiere if avec_tendance else None, config_de())
         lignes.append(_ligne(
             nom, res, b, regles, leviers, n_departs, False,
             n_longs=sum(t.direction == 1 for t in res.trades),
